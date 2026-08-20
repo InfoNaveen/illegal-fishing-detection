@@ -221,20 +221,10 @@ def _compute_stats(df: pd.DataFrame, alerts: list) -> dict:
 stats = _compute_stats(df, alerts)
 
 # ---------------------------------------------------------------------------
-# Vessel selection state — single source of truth used by both the
-# main-page inspector and the sidebar display.
-# ---------------------------------------------------------------------------
-_RISK_COLOURS = {"HIGH": "#FF3333", "MEDIUM": "#FF8C00", "LOW": "#2ECC71"}
-vessel_ids_sorted = ["— Select a vessel —"] + sorted(df["vessel_id"].tolist())
-
-# The selectbox key "vessel_select" is shared by both the main-page and
-# sidebar widgets.  Streamlit keeps them in sync via session_state.
-if "vessel_select" not in st.session_state:
-    st.session_state["vessel_select"] = "— Select a vessel —"
-
-# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+_RISK_COLOURS = {"HIGH": "#FF3333", "MEDIUM": "#FF8C00", "LOW": "#2ECC71"}
+
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center;padding:16px 0 8px;">
@@ -252,10 +242,9 @@ with st.sidebar:
     st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
                 unsafe_allow_html=True)
 
-    st.selectbox("Sidebar Vessel ID", vessel_ids_sorted,
-                 key="vessel_select",
-                 label_visibility="collapsed")
-    selected_vessel = st.session_state["vessel_select"]
+    vessel_ids_sorted = ["— Select a vessel —"] + sorted(df["vessel_id"].tolist())
+    selected_vessel   = st.selectbox("Vessel ID", vessel_ids_sorted,
+                                     label_visibility="collapsed")
 
     if selected_vessel != "— Select a vessel —":
         row         = df[df["vessel_id"] == selected_vessel].iloc[0]
@@ -443,166 +432,9 @@ with c5:
 
 st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
 
-# ── Main-page Vessel Inspector ───────────────────────────────────────────────
-# Always visible regardless of sidebar state — primary control for demos.
-st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
-            unsafe_allow_html=True)
-
-insp_sel_col, insp_detail_col = st.columns([1, 3], gap="medium")
-
-with insp_sel_col:
-    st.selectbox(
-        "Select Vessel ID",
-        vessel_ids_sorted,
-        key="vessel_select",          # shared key — synced with sidebar
-        label_visibility="visible",
-    )
-    main_sel = st.session_state["vessel_select"]
-
-    # Quick-select buttons for the three demo HIGH-risk vessels
-    st.markdown("<div style='margin-top:8px;font-size:0.72rem;color:#4a6a9a;'>Quick select:</div>",
-                unsafe_allow_html=True)
-    qs_cols = st.columns(3)
-    for i, qvid in enumerate(["V102", "V087", "V215"]):
-        with qs_cols[i]:
-            if st.button(qvid, key=f"qs_{qvid}", use_container_width=True):
-                st.session_state["vessel_select"] = qvid
-                st.rerun()
-
-with insp_detail_col:
-    main_sel = st.session_state["vessel_select"]
-    if main_sel != "— Select a vessel —":
-        irow         = df[df["vessel_id"] == main_sel].iloc[0]
-        irc          = _RISK_COLOURS.get(irow["risk_level"], "#888")
-        irisk_result = risk_map[main_sel]
-        ianom        = anomaly_map[main_sel]
-        ifactors     = irisk_result.get("factors", [])
-
-        # Two sub-columns: vessel fields | risk breakdown
-        vcol, bcol = st.columns(2, gap="small")
-
-        with vcol:
-            st.markdown(f"""
-            <div class="info-card" style="border-left:3px solid {irc};">
-              <div style="color:#00d4ff;font-weight:700;font-size:1rem;margin-bottom:10px;">
-                ⚓ {irow['vessel_id']}
-                <span style="float:right;background:{irc};color:#fff;
-                             padding:2px 8px;border-radius:4px;font-size:0.75rem;">
-                  {irow['risk_level']}
-                </span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Speed</span>
-                <span class="info-value">{irow['speed']} kn</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Heading</span>
-                <span class="info-value">{irow['heading']}°</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Position</span>
-                <span class="info-value">{irow['latitude']}°N, {irow['longitude']}°E</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Risk Score</span>
-                <span class="info-value" style="color:{irc};">{irow['risk_score']}/100</span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Zone Status</span>
-                <span class="info-value" style="color:#ffd700;font-size:0.73rem;">
-                  {irow['zone_status']}
-                </span>
-              </div>
-              <div class="info-row">
-                <span class="info-label">Behavior</span>
-                <span class="info-value" style="font-size:0.73rem;">{irow['behavior']}</span>
-              </div>
-              <div class="info-row" style="border-bottom:none;">
-                <span class="info-label">IF Anomaly Score</span>
-                <span class="info-value" style="color:#a78bfa;">
-                  {ianom['anomaly_score']:.3f}{"  🔺" if ianom['is_anomalous'] else ""}
-                </span>
-              </div>
-              {f'<div class="info-row" style="border-bottom:none;margin-top:4px;"><span class="info-label">AIS Gap</span><span class="info-value" style="color:#ffcc00;">⚠️ {irisk_result["ais_gap_minutes"]} min blackout</span></div>' if irisk_result.get("ais_gap_minutes", 0) >= 20 else ""}
-              <div style="margin-top:10px;">
-                <div style="font-size:0.7rem;color:#4a6a9a;margin-bottom:4px;">RISK INDICATOR</div>
-                <div class="risk-bar-wrap">
-                  <div class="risk-bar-fill" style="width:{irow['risk_score']}%;background:{irc};"></div>
-                </div>
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with bcol:
-            if ifactors:
-                st.markdown("""
-                <div style="font-size:0.75rem;font-weight:600;color:#00d4ff;
-                            letter-spacing:0.06em;margin-bottom:8px;">
-                  RISK FACTOR BREAKDOWN
-                </div>
-                """, unsafe_allow_html=True)
-                for f in ifactors:
-                    pct = min(int(f["contribution"] / f["max_weight"] * 100), 100)
-                    st.markdown(f"""
-                    <div style="margin-bottom:8px;">
-                      <div style="display:flex;justify-content:space-between;
-                                  font-size:0.76rem;margin-bottom:3px;">
-                        <span style="color:#a0b8d8;">{f['factor']}</span>
-                        <span style="color:#ff6666;font-weight:700;">+{f['contribution']}</span>
-                      </div>
-                      <div class="risk-bar-wrap">
-                        <div class="risk-bar-fill"
-                             style="width:{pct}%;background:#ff4444;opacity:0.7;"></div>
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                st.markdown(f"""
-                <div style="background:#1a0505;border:1px solid #ff3333;border-radius:6px;
-                            padding:6px 12px;margin-top:4px;text-align:center;">
-                  <span style="color:#aaa;font-size:0.72rem;">TOTAL &nbsp;</span>
-                  <span style="color:#ff3333;font-size:1.2rem;font-weight:700;">
-                    {irow['risk_score']}/100
-                  </span>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # Feature values compact table
-            if main_sel in feature_df.index:
-                feat_row = feature_df.loc[main_sel]
-                st.markdown("""
-                <div style="font-size:0.75rem;font-weight:600;color:#00d4ff;
-                            letter-spacing:0.06em;margin:12px 0 6px;">
-                  BEHAVIOURAL FEATURES
-                </div>
-                """, unsafe_allow_html=True)
-                feat_labels = {
-                    "loitering_score":     "Loitering Score",
-                    "speed_deviation":     "Speed Deviation",
-                    "erratic_score":       "Erratic Score",
-                    "zone_proximity_norm": "Zone Proximity",
-                    "displacement_ratio":  "Displacement Ratio",
-                }
-                for key, label in feat_labels.items():
-                    st.markdown(f"""
-                    <div class="info-row">
-                      <span class="info-label">{label}</span>
-                      <span class="info-value">{feat_row[key]:.4f}</span>
-                    </div>""", unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div style="background:#0d1b35;border:1px dashed #1e3a6e;border-radius:8px;
-                    padding:24px;text-align:center;color:#4a6a9a;font-size:0.85rem;">
-          ← Select a vessel ID to view detection details,<br>
-          risk breakdown, and Isolation Forest anomaly score.
-        </div>
-        """, unsafe_allow_html=True)
-
-st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
-
 # ── Map + right panel ────────────────────────────────────────────────────────
 map_col, panel_col = st.columns([3, 1], gap="medium")
-sel = st.session_state.get("vessel_select", "— Select a vessel —")
-sel = sel if sel != "— Select a vessel —" else ""
+sel = selected_vessel if selected_vessel != "— Select a vessel —" else ""
 
 with map_col:
     st.markdown('<div class="section-header">🗺️ Live Vessel Tracking Map</div>',
