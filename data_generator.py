@@ -207,3 +207,22 @@ def build_all_trajectories(vessel_df: pd.DataFrame) -> Dict[str, List[Tuple[floa
 def get_restricted_zones() -> List[Dict]:
     """Return the list of restricted zone definitions."""
     return RESTRICTED_ZONES
+
+
+# ---------------------------------------------------------------------------
+# AIS gap data
+# Keyed by vessel_id.  Value = gap duration in minutes (deterministic demo).
+# A value of 0 means no gap detected.
+# ---------------------------------------------------------------------------
+AIS_GAP_MINUTES: Dict[str, int] = {
+    "V119": 47,   # primary demo vessel — 47-minute gap
+    "V034": 22,   # secondary — short gap
+    "V201": 31,   # secondary — moderate gap
+}
+
+AIS_GAP_THRESHOLD_MINUTES: int = 20   # gaps >= this are flagged
+
+
+def get_ais_gap(vessel_id: str) -> int:
+    """Return AIS gap in minutes for a vessel (0 = no gap)."""
+    return AIS_GAP_MINUTES.get(vessel_id, 0)

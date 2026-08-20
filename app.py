@@ -302,6 +302,12 @@ with st.sidebar:
               {"  🔺" if anom['is_anomalous'] else ""}
             </span>
           </div>
+          {f'''<div class="info-row" style="border-bottom:none;margin-top:4px;">
+            <span class="info-label">AIS Gap</span>
+            <span class="info-value" style="color:#ffcc00;font-size:0.75rem;">
+              ⚠️ {risk_result["ais_gap_minutes"]} min blackout
+            </span>
+          </div>''' if risk_result.get("ais_gap_minutes", 0) >= 20 else ""}
           <div style="margin-top:10px;">
             <div style="font-size:0.7rem;color:#4a6a9a;margin-bottom:4px;">
               RISK SCORE INDICATOR

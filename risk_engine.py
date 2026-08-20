@@ -31,10 +31,11 @@ W_SPEED_ANOMALY   = 12   # speed_deviation contribution
 W_ERRATIC         = 10   # erratic_score contribution
 W_ML_ANOMALY      = 25   # Isolation Forest normalised anomaly_score
 W_COMBO_BOOST     = 8    # bonus when loitering+erratic both elevated (suspicious combo)
-# Maximum possible raw sum = 40+15+20+12+10+25+8 = 130 → normalise to 100
+W_AIS_GAP         = 10   # AIS signal gap detected
+# Maximum possible raw sum = 40+15+20+12+10+25+8+10 = 140 → normalise to 100
 
 RAW_MAX = W_ZONE_VIOLATION + W_ZONE_PROXIMITY + W_LOITERING + \
-          W_SPEED_ANOMALY + W_ERRATIC + W_ML_ANOMALY + W_COMBO_BOOST
+          W_SPEED_ANOMALY + W_ERRATIC + W_ML_ANOMALY + W_COMBO_BOOST + W_AIS_GAP
 
 # ---------------------------------------------------------------------------
 # Risk thresholds
@@ -74,7 +75,8 @@ def _derive_behavior(geo: Dict, feat: Dict, anomaly: Dict) -> str:
 def compute_risk(vessel_id: str,
                  geo: Dict,
                  feat: Dict,
-                 anomaly: Dict) -> Dict:
+                 anomaly: Dict,
+                 ais_gap_minutes: int = 0) -> Dict:
     """
     Compute risk for a single vessel.
 
@@ -166,6 +168,19 @@ def compute_risk(vessel_id: str,
         })
         raw_total += contrib
 
+    # ── AIS signal gap ────────────────────────────────────────────────────
+    from data_generator import AIS_GAP_THRESHOLD_MINUTES
+    if ais_gap_minutes >= AIS_GAP_THRESHOLD_MINUTES:
+        # Scale contribution: 20 min → ~50% weight, 60 min → 100%
+        gap_frac = min(ais_gap_minutes / 60.0, 1.0)
+        contrib  = W_AIS_GAP * gap_frac
+        factors.append({
+            "factor":      f"AIS Signal Gap ({ais_gap_minutes} min)",
+            "contribution": int(round(contrib)),
+            "max_weight":  W_AIS_GAP,
+        })
+        raw_total += contrib
+
     # ── Combo boost: loitering + erratic together is more suspicious ──────
     if loiter > 0.40 and erratic > 0.50:
         combo = W_COMBO_BOOST * min((loiter + erratic) / 2.0, 1.0)
@@ -191,12 +206,13 @@ def compute_risk(vessel_id: str,
     zone_status = geo["zone_status"]
 
     return {
-        "vessel_id":  vessel_id,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "behavior":   behavior,
-        "zone_status": zone_status,
-        "factors":    factors,
+        "vessel_id":       vessel_id,
+        "risk_score":      risk_score,
+        "risk_level":      risk_level,
+        "behavior":        behavior,
+        "zone_status":     zone_status,
+        "factors":         factors,
+        "ais_gap_minutes": ais_gap_minutes,
     }
 
 
@@ -213,6 +229,7 @@ def run_risk_engine(vessel_ids: List[str],
 
     Returns {vessel_id: risk_result_dict}
     """
+    from data_generator import get_ais_gap
     results: Dict[str, Dict] = {}
     for vid in vessel_ids:
         geo     = geo_map.get(vid, {"inside": False, "near": False,
@@ -221,7 +238,8 @@ def run_risk_engine(vessel_ids: List[str],
                                     "zone_status": "Open Waters"})
         feat    = feature_df.loc[vid].to_dict() if vid in feature_df.index else {}
         anomaly = anomaly_map.get(vid, {"anomaly_score": 0.0, "is_anomalous": False})
-        results[vid] = compute_risk(vid, geo, feat, anomaly)
+        gap     = get_ais_gap(vid)
+        results[vid] = compute_risk(vid, geo, feat, anomaly, ais_gap_minutes=gap)
     return results
 
 
@@ -264,6 +282,10 @@ def generate_alerts(risk_results: Dict[str, Dict]) -> List[Dict]:
         elif "Loitering" in behavior:
             message = (f"{vid} showing sustained loitering behaviour "
                        f"(score: {score}/100). Possible illegal fishing activity.")
+        elif "AIS Gap" in reason or result.get("ais_gap_minutes", 0) >= 20:
+            gap = result.get("ais_gap_minutes", 0)
+            message = (f"{vid} AIS signal gap of {gap} minutes recorded "
+                       f"— vessel went dark. Suspicious blackout period.")
         elif "Speed Anomaly" in behavior:
             message = (f"{vid} speed anomaly detected "
                        f"— movement pattern inconsistent with normal fishing.")
