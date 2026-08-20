@@ -1,7 +1,7 @@
 """
 data_generator.py
 Generates simulated vessel base data and trajectories for the
-Illegal Fishing Detection System — Round 2.
+Illegal Fishing Detection System.
 
 Changes from Round 1:
   - Hard-coded risk_score / risk_level / zone_status REMOVED from seed data.
@@ -112,7 +112,7 @@ def generate_vessel_dataframe() -> pd.DataFrame:
     Columns: vessel_id, latitude, longitude, speed, heading, behavior
 
     risk_score / risk_level / zone_status are NOT included here —
-    they are computed by the Round 2 pipeline and merged into this DataFrame
+    they are computed by the detection pipeline and merged into this DataFrame
     inside app.py before the dashboard renders.
     """
     rows = []

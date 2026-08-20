@@ -1,6 +1,6 @@
 """
 app.py
-Main Streamlit dashboard for the Illegal Fishing Detection System — Round 2.
+Main Streamlit dashboard for the Illegal Fishing Detection System.
 
 Pipeline (all computed once and cached):
   1. generate_vessel_dataframe()     → raw vessel fields
@@ -153,7 +153,7 @@ html, body, [data-testid="stApp"] {
 @st.cache_data
 def run_pipeline() -> tuple:
     """
-    Execute the complete Round 2 detection pipeline.
+    Execute the complete detection pipeline.
 
     Returns
     -------
@@ -380,9 +380,8 @@ with st.sidebar:
     st.markdown('<hr style="border-color:#1e2d50;margin:20px 0 12px;">', unsafe_allow_html=True)
     st.markdown("""
     <div style="font-size:0.68rem;color:#2a4060;text-align:center;line-height:1.6;">
-      Round 2 · Live Pipeline · Isolation Forest<br>
-      Bay of Bengal Region<br>
-      <span style="color:#1e3a6e;">© 2025 IFDS Project</span>
+      Live Detection Pipeline · Isolation Forest<br>
+      Bay of Bengal · Maritime Surveillance
     </div>
     """, unsafe_allow_html=True)
 
@@ -403,7 +402,7 @@ st.markdown("""
       Illegal Fishing Detection System
     </div>
     <div style="font-size:0.78rem;color:#4a6a9a;letter-spacing:0.1em;margin-top:2px;">
-      MARITIME VESSEL MONITORING · BAY OF BENGAL · ROUND 2 PROTOTYPE
+      MARITIME VESSEL MONITORING · BAY OF BENGAL · ANOMALY DETECTION PROTOTYPE
     </div>
   </div>
   <div style="margin-left:auto;text-align:right;">
@@ -483,7 +482,7 @@ with panel_col:
 st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
 
 # ── Pipeline section ─────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">⚙️ Round 2 Detection Pipeline</div>',
+st.markdown('<div class="section-header">⚙️ Detection Pipeline</div>',
             unsafe_allow_html=True)
 
 pipeline_steps = [
@@ -594,7 +593,7 @@ st.markdown("<div style='margin-bottom:24px;'></div>", unsafe_allow_html=True)
 st.markdown("""
 <div style="text-align:center;padding:16px;border-top:1px solid #1e2d50;
             color:#2a4060;font-size:0.7rem;letter-spacing:0.06em;">
-  ILLEGAL FISHING DETECTION SYSTEM · ROUND 2 · ISOLATION FOREST ANOMALY DETECTION
-  &nbsp;|&nbsp; Bay of Bengal Maritime Surveillance · © 2025
+  ILLEGAL FISHING DETECTION SYSTEM · ISOLATION FOREST ANOMALY DETECTION
+  &nbsp;|&nbsp; Bay of Bengal Maritime Surveillance
 </div>
 """, unsafe_allow_html=True)
