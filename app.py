@@ -31,6 +31,16 @@ from anomaly_detector import run_anomaly_detection
 from risk_engine import run_risk_engine, generate_alerts
 from map_builder import build_map
 
+# ── Round 3 M1: historical AIS ingestion (additive, optional path) ──────────
+from ais_loader import (
+    load_vessel_dataframe,
+    build_trajectories_from_ais,
+    summarize_latest_positions,
+    DEFAULT_AIS_CSV_PATH,
+    AISFileError,
+    AISColumnError,
+)
+
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
 # ---------------------------------------------------------------------------
@@ -151,9 +161,19 @@ html, body, [data-testid="stApp"] {
 # ---------------------------------------------------------------------------
 
 @st.cache_data
-def run_pipeline() -> tuple:
+def run_pipeline(source: str = "Simulated",
+                 csv_path: str = DEFAULT_AIS_CSV_PATH) -> tuple:
     """
     Execute the complete detection pipeline.
+
+    Parameters
+    ----------
+    source : str
+        "Simulated" (default) uses the built-in synthetic vessel generator.
+        "Historical AIS" loads vessel movement data from a local CSV via
+        ais_loader and feeds it through the SAME downstream pipeline.
+    csv_path : str
+        Path to the historical AIS CSV (only used when source == "Historical AIS").
 
     Returns
     -------
@@ -162,14 +182,23 @@ def run_pipeline() -> tuple:
     anomaly_map : {vessel_id: {anomaly_score, is_anomalous}}
     risk_map    : {vessel_id: risk_result_dict}
     feature_df  : feature DataFrame (used by ML details panel)
+
+    Notes
+    -----
+    Only steps 1 and 2 (raw data + trajectories) differ between the two
+    sources. Everything from geofencing onward is identical and unchanged.
     """
     zones = get_restricted_zones()
 
-    # 1. Raw vessel data
-    base_df = generate_vessel_dataframe()
-
-    # 2. Trajectories
-    trajectories = build_all_trajectories(base_df)
+    # 1 + 2. Raw vessel data + trajectories (source-dependent).
+    if source == "Historical AIS":
+        ais_df       = load_vessel_dataframe(csv_path)       # may raise AISFileError/AISColumnError
+        trajectories = build_trajectories_from_ais(ais_df)   # full multi-point tracks
+        base_df      = summarize_latest_positions(ais_df)    # one current row per vessel
+    else:
+        # Default simulated path — unchanged from Round 2.
+        base_df      = generate_vessel_dataframe()
+        trajectories = build_all_trajectories(base_df)
 
     # 3. Geofencing
     geo_list = run_geofencing(base_df, zones)
@@ -198,7 +227,30 @@ def run_pipeline() -> tuple:
     return df, alerts, anomaly_map, risk_map, feature_df
 
 
-df, alerts, anomaly_map, risk_map, feature_df = run_pipeline()
+# ---------------------------------------------------------------------------
+# Data source selection (Round 3 M1) — chosen in the sidebar below, but read
+# here so the pipeline runs with the correct source. Default is "Simulated".
+# ---------------------------------------------------------------------------
+if "data_source" not in st.session_state:
+    st.session_state["data_source"] = "Simulated"
+
+_active_source = st.session_state["data_source"]
+_ais_error_message = ""
+
+try:
+    df, alerts, anomaly_map, risk_map, feature_df = run_pipeline(
+        source=_active_source,
+        csv_path=DEFAULT_AIS_CSV_PATH,
+    )
+except (AISFileError, AISColumnError) as exc:
+    # Historical AIS unavailable/invalid — fall back to simulated so the
+    # dashboard never crashes, and surface a clear message in the sidebar.
+    _ais_error_message = str(exc)
+    _active_source = "Simulated"
+    df, alerts, anomaly_map, risk_map, feature_df = run_pipeline(
+        source="Simulated",
+        csv_path=DEFAULT_AIS_CSV_PATH,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +290,34 @@ with st.sidebar:
     </div>
     <hr style="border-color:#1e2d50;margin:8px 0 16px;">
     """, unsafe_allow_html=True)
+
+    # ── Data source selector (Round 3 M1) ───────────────────────────────────
+    st.markdown('<div class="section-header">🛰️ Data Source</div>',
+                unsafe_allow_html=True)
+    st.radio(
+        "Data Source",
+        options=["Simulated", "Historical AIS"],
+        key="data_source",
+        label_visibility="collapsed",
+    )
+    if _active_source == "Historical AIS" and not _ais_error_message:
+        st.markdown(
+            '<div style="font-size:0.68rem;color:#2ECC71;margin:-4px 0 10px;">'
+            '● Historical AIS loaded</div>',
+            unsafe_allow_html=True,
+        )
+    elif _ais_error_message:
+        st.warning(
+            "Historical AIS dataset not found or invalid. "
+            "Add a CSV file to data/ or configure the AIS dataset path. "
+            "Showing simulated data instead."
+        )
+    else:
+        st.markdown(
+            '<div style="font-size:0.68rem;color:#4a6a9a;margin:-4px 0 10px;">'
+            '● Using built-in simulated fleet</div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
                 unsafe_allow_html=True)

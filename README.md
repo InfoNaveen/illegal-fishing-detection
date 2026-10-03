@@ -6,8 +6,11 @@ anomalous behaviour patterns, detects restricted-zone violations, calculates dyn
 per-vessel risk scores, and generates prioritised alerts — all within an interactive
 Streamlit dashboard.
 
-> **Note:** The current implementation uses **simulated vessel and trajectory data** for
-> demonstration purposes. It is not connected to a live AIS feed or production data source.
+> **Note:** The system runs in two modes. **Simulated** (default) uses a built-in
+> synthetic vessel fleet. **Historical AIS** ingests vessel-movement data from a local
+> CSV file via the AIS loader. The project does **not** provide a live AIS feed, real-time
+> satellite data, or production maritime surveillance — ingestion is from historical/local
+> data only.
 
 ---
 
@@ -138,6 +141,70 @@ pipeline. It provides:
 
 ---
 
+## Data Sources
+
+The dashboard sidebar provides a **Data Source** selector with two modes.
+
+### Simulated (default)
+
+Uses the built-in synthetic vessel fleet from `data_generator.py`
+(`generate_vessel_dataframe()` + `build_all_trajectories()`). This is the original,
+fully reproducible demonstration fleet and remains the default. Nothing about this mode
+has changed.
+
+### Historical AIS
+
+Ingests vessel-movement data from a **local historical AIS CSV** via `ais_loader.py`,
+then feeds the normalised result through the exact same downstream pipeline (geofencing →
+feature engineering → Isolation Forest → risk engine → alerts). No separate pipeline, no
+duplicated risk engine or anomaly detector.
+
+AIS (Automatic Identification System) data describes vessel **movement only**. It does not
+by itself prove illegal fishing. Suspicious-behaviour detection is performed entirely by
+the downstream analysis pipeline. The loader therefore does **not** assign any
+fishing/illegal behaviour label to raw AIS records.
+
+> This is **historical AIS data ingestion** from a local CSV — not a live AIS feed, not a
+> commercial API, and not real-time satellite data. No API key or network access is
+> required.
+
+#### Expected CSV schema
+
+The loader normalises common AIS column-name variants to a fixed internal schema. Provide
+at least a vessel identifier, latitude, and longitude; speed, heading, and timestamp are
+used when present.
+
+| Internal field | Recognised source column aliases (case-insensitive) | Required |
+|---|---|---|
+| `vessel_id` | `MMSI`, `vessel_id`, `id`, `ship_id` | **Yes** |
+| `latitude`  | `LAT`, `latitude`, `y` | **Yes** |
+| `longitude` | `LON`, `long`, `lng`, `longitude`, `x` | **Yes** |
+| `speed`     | `SOG`, `speed`, `speed_over_ground` | No (defaults to 0.0) |
+| `heading`   | `COG`, `heading`, `course`, `course_over_ground` | No (defaults to 0.0) |
+| `timestamp` | `BaseDateTime`, `timestamp`, `time`, `datetime` | No (row order used if absent) |
+
+If a **required** column cannot be resolved, the loader raises a clear error naming the
+missing field. Rows with invalid coordinates (latitude outside ±90, longitude outside
+±180, or non-numeric) are dropped — never fabricated.
+
+#### Configuring the AIS CSV
+
+Place a CSV at the repository-relative default path:
+
+```
+data/sample_ais.csv
+```
+
+The bundled `data/sample_ais.csv` is a **tiny synthetic test fixture** (vessel IDs
+`TEST001`…) used only for automated tests and to let Historical AIS mode start without an
+external download. It is **not** real AIS data. To use genuine data, replace that file
+with a historical AIS CSV from a public maritime open-data source.
+
+If the file is missing or invalid, the dashboard shows a clear message and automatically
+falls back to Simulated mode — it never crashes.
+
+---
+
 ## Technology Stack
 
 | Library | Purpose |
@@ -161,11 +228,17 @@ illegal-fishing-detection/
 │
 ├── app.py                  # Streamlit dashboard — UI and pipeline orchestration
 ├── data_generator.py       # Simulated vessel fleet, trajectory generation, AIS gap data
+├── ais_loader.py           # Historical AIS CSV ingestion + normalisation (Historical AIS mode)
 ├── map_builder.py          # Folium map construction (zones, trails, markers, legend)
 ├── geofencing.py           # Point-in-polygon zone detection and proximity scoring
 ├── feature_engineering.py  # Behavioural feature extraction from trajectories
 ├── anomaly_detector.py     # Isolation Forest model training and scoring
 ├── risk_engine.py          # Weighted risk scoring, classification, alert generation
+│
+├── test_ais_loader.py      # Focused tests for the AIS ingestion layer
+├── data/
+│   ├── sample_ais.csv      # Tiny synthetic TEST FIXTURE (not real AIS data)
+│   └── README.md           # Notes on the data directory and real AIS usage
 │
 ├── requirements.txt        # Pinned Python dependencies
 ├── .gitignore              # Excludes venv, __pycache__, secrets, data files
@@ -305,15 +378,18 @@ Isolation Forest does not generalise beyond the data it was fitted on.
 
 ## Current Limitations
 
-- All vessel data and trajectories are **simulated** — no live or historical AIS feed
-- Fleet size is 18 vessels — too small for a statistically robust anomaly model
+- The default fleet is **simulated**; Historical AIS mode reads a **local CSV only** —
+  there is still no live AIS feed or real-time data source
+- The bundled `data/sample_ais.csv` is a synthetic test fixture, not real AIS data
+- In Historical AIS mode the pipeline currently uses each vessel's **latest** position for
+  scoring; richer time-series trajectory analysis is future work
+- Simulated fleet size is 18 vessels — too small for a statistically robust anomaly model
 - The Isolation Forest model is **re-fitted on every application run** — no persistent model
 - Risk weights and classification thresholds are prototype values, not domain-calibrated
-- No long-term historical vessel tracking or time-series analysis
 - No database — all state is in-memory and resets on restart
 - No authentication or access control
 - No real-time alert delivery (email, SMS, etc.)
-- AIS gap durations are deterministic demo values, not computed from actual signal logs
+- Simulated AIS gap durations are deterministic demo values, not computed from actual signal logs
 
 ---
 
