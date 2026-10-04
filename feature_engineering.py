@@ -193,7 +193,8 @@ FEATURE_COLUMNS: List[str] = [
 
 def build_feature_matrix(vessel_df,
                          trajectories: Dict[str, List[Tuple[float, float]]],
-                         geo_results: Dict[str, Dict]) -> "pd.DataFrame":
+                         geo_results: Dict[str, Dict],
+                         behavior_map: Dict[str, Dict] = None) -> "pd.DataFrame":
     """
     Build a feature DataFrame for all vessels.
 
@@ -203,12 +204,22 @@ def build_feature_matrix(vessel_df,
                    speed, heading
     trajectories : {vessel_id: [(lat, lon), ...]}
     geo_results  : {vessel_id: geo_result_dict}
+    behavior_map : optional {vessel_id: behaviour_dict} from behavior_analysis.
+                   When provided (M4), the numeric behavioural feature columns
+                   (BEHAVIOR_FEATURE_COLUMNS) are appended to each row and to
+                   the returned column set. When None, the original 9-column
+                   contract is preserved exactly (back-compatible).
 
     Returns
     -------
-    DataFrame indexed by vessel_id with FEATURE_COLUMNS as columns.
+    DataFrame indexed by vessel_id. Columns are FEATURE_COLUMNS, plus the
+    numeric behaviour columns when behavior_map is supplied.
     """
     import pandas as pd
+
+    use_behavior = behavior_map is not None
+    if use_behavior:
+        from behavior_analysis import BEHAVIOR_FEATURE_COLUMNS, behavior_feature_row
 
     rows = []
     for _, row in vessel_df.iterrows():
@@ -227,7 +238,12 @@ def build_feature_matrix(vessel_df,
             trajectory=traj,
             geo_result=geo,
         )
+        if use_behavior:
+            feat.update(behavior_feature_row(behavior_map.get(vid, {})))
         rows.append(feat)
 
     df = pd.DataFrame(rows).set_index("vessel_id")
-    return df[FEATURE_COLUMNS]
+    columns = list(FEATURE_COLUMNS)
+    if use_behavior:
+        columns = columns + list(BEHAVIOR_FEATURE_COLUMNS)
+    return df[columns]

@@ -76,7 +76,8 @@ def compute_risk(vessel_id: str,
                  geo: Dict,
                  feat: Dict,
                  anomaly: Dict,
-                 ais_gap_minutes: int = 0) -> Dict:
+                 ais_gap_minutes: int = 0,
+                 behavior: Dict = None) -> Dict:
     """
     Compute risk for a single vessel.
 
@@ -181,6 +182,35 @@ def compute_risk(vessel_id: str,
         })
         raw_total += contrib
 
+    # ── Behavioural signals (M4) — trajectory-derived, explainable ────────
+    # These augment, not replace, the existing signals. A trajectory-derived
+    # AIS gap contributes to the same AIS-gap weight budget if the per-vessel
+    # ais_gap_minutes above was 0 (e.g. historical AIS where gaps come from
+    # timestamps, not the simulated AIS_GAP_MINUTES table). High turning adds a
+    # small erratic-style contribution.
+    behavior = behavior or {}
+    traj_gap = float(behavior.get("max_ais_gap_minutes", 0.0))
+    if ais_gap_minutes < 20 and traj_gap >= 20:
+        gap_frac = min(traj_gap / 60.0, 1.0)
+        contrib  = W_AIS_GAP * gap_frac
+        factors.append({
+            "factor":      f"AIS Signal Gap ({int(traj_gap)} min)",
+            "contribution": int(round(contrib)),
+            "max_weight":  W_AIS_GAP,
+        })
+        raw_total += contrib
+
+    mean_turn = float(behavior.get("mean_heading_change", 0.0))
+    if mean_turn >= 45.0:
+        turn_frac = min(mean_turn / 120.0, 1.0)
+        contrib = W_ERRATIC * turn_frac
+        factors.append({
+            "factor":      "Excessive Turning / Course Changes",
+            "contribution": int(round(contrib)),
+            "max_weight":  W_ERRATIC,
+        })
+        raw_total += contrib
+
     # ── Combo boost: loitering + erratic together is more suspicious ──────
     if loiter > 0.40 and erratic > 0.50:
         combo = W_COMBO_BOOST * min((loiter + erratic) / 2.0, 1.0)
@@ -202,17 +232,25 @@ def compute_risk(vessel_id: str,
     else:
         risk_level = "LOW"
 
-    behavior   = _derive_behavior(geo, feat, anomaly)
+    behavior_label = _derive_behavior(geo, feat, anomaly)
     zone_status = geo["zone_status"]
 
+    # ── Explainable risk factors (plain-language, M4) ─────────────────────
+    risk_factors: List[str] = [f["factor"] for f in factors]
+    if not risk_factors:
+        risk_factors = ["No elevated risk indicators"]
+
     return {
-        "vessel_id":       vessel_id,
-        "risk_score":      risk_score,
-        "risk_level":      risk_level,
-        "behavior":        behavior,
-        "zone_status":     zone_status,
-        "factors":         factors,
-        "ais_gap_minutes": ais_gap_minutes,
+        "vessel_id":        vessel_id,
+        "risk_score":       risk_score,
+        "risk_level":       risk_level,
+        "behavior":         behavior_label,
+        "zone_status":      zone_status,
+        "factors":          factors,
+        "risk_factors":     risk_factors,
+        "ais_gap_minutes":  ais_gap_minutes,
+        "behavior_summary": behavior.get("behavior_summary", ""),
+        "behavior_labels":  behavior.get("behavior_labels", []),
     }
 
 
@@ -223,13 +261,19 @@ def compute_risk(vessel_id: str,
 def run_risk_engine(vessel_ids: List[str],
                     geo_map: Dict[str, Dict],
                     feature_df,
-                    anomaly_map: Dict[str, Dict]) -> Dict[str, Dict]:
+                    anomaly_map: Dict[str, Dict],
+                    behavior_map: Dict[str, Dict] = None) -> Dict[str, Dict]:
     """
     Run the risk engine for all vessels.
+
+    behavior_map : optional {vessel_id: behaviour_dict} from behavior_analysis
+                   (M4). When None, behaviour contributions are simply absent
+                   and the engine behaves as before.
 
     Returns {vessel_id: risk_result_dict}
     """
     from data_generator import get_ais_gap
+    behavior_map = behavior_map or {}
     results: Dict[str, Dict] = {}
     for vid in vessel_ids:
         geo     = geo_map.get(vid, {"inside": False, "near": False,
@@ -239,7 +283,9 @@ def run_risk_engine(vessel_ids: List[str],
         feat    = feature_df.loc[vid].to_dict() if vid in feature_df.index else {}
         anomaly = anomaly_map.get(vid, {"anomaly_score": 0.0, "is_anomalous": False})
         gap     = get_ais_gap(vid)
-        results[vid] = compute_risk(vid, geo, feat, anomaly, ais_gap_minutes=gap)
+        results[vid] = compute_risk(vid, geo, feat, anomaly,
+                                    ais_gap_minutes=gap,
+                                    behavior=behavior_map.get(vid))
     return results
 
 
@@ -281,11 +327,12 @@ def generate_alerts(risk_results: Dict[str, Dict]) -> List[Dict]:
                        f"— {zone_stat}. Immediate investigation required.")
         elif "Loitering" in behavior:
             message = (f"{vid} showing sustained loitering behaviour "
-                       f"(score: {score}/100). Possible illegal fishing activity.")
+                       f"(score: {score}/100). Suspicious fishing-related "
+                       f"behaviour indicators detected.")
         elif "AIS Gap" in reason or result.get("ais_gap_minutes", 0) >= 20:
             gap = result.get("ais_gap_minutes", 0)
             message = (f"{vid} AIS signal gap of {gap} minutes recorded "
-                       f"— vessel went dark. Suspicious blackout period.")
+                       f"— suspicious reporting-gap behaviour indicator.")
         elif "Speed Anomaly" in behavior:
             message = (f"{vid} speed anomaly detected "
                        f"— movement pattern inconsistent with normal fishing.")

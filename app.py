@@ -46,6 +46,8 @@ from zones import get_zones, get_region_meta
 # ── Round 3 M3: SQLite persistence (history sink — never a hard dependency) ──
 import database
 from database import DatabaseError, DEFAULT_DB_PATH
+# ── Round 3 M4: trajectory & behaviour analysis ─────────────────────────────
+from behavior_analysis import analyze_all
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -202,6 +204,11 @@ def run_pipeline(source: str = "Simulated",
     quality_report: dict = {}
     positions_df = None   # cleaned positions to persist (Historical AIS only)
 
+    # map_trajectories: {vessel_id: [(lat,lon),...]} — real historical tracks
+    # (AIS) or synthetic trails (simulated), used by the map for the selected
+    # vessel. behavior_trajectories feed the M4 behaviour analysis.
+    map_trajectories: dict = {}
+
     # 1 + 2. Raw vessel data + trajectories (source-dependent).
     if source == "Historical AIS":
         ais_df = load_vessel_dataframe(csv_path)             # may raise AISFileError/AISColumnError
@@ -215,24 +222,39 @@ def run_pipeline(source: str = "Simulated",
                                  "latitude", "longitude",
                                  "speed", "heading"]].copy()
         positions_df["timestamp"] = positions_df["timestamp"].astype(str)
+        # M4: behaviour analysis consumes time-aware DataFrame slices. Group the
+        # cleaned frame ONCE (O(n)) into per-vessel slices to avoid O(n^2).
+        behavior_trajectories = {
+            str(vid): grp[["latitude", "longitude", "speed", "heading", "timestamp"]]
+            for vid, grp in clean_df.groupby("vessel_id", sort=False)
+        }
+        map_trajectories = trajectories  # real chronological (lat,lon) tracks
     else:
         # Default simulated path — unchanged from Round 2.
         base_df      = generate_vessel_dataframe()
         trajectories = build_all_trajectories(base_df)
+        # Simulated behaviour uses the (lat,lon) tuple trajectories directly.
+        behavior_trajectories = trajectories
+        map_trajectories = trajectories
+
+    # 2b. Behaviour analysis (M4) — per-vessel, operates on ordered tracks.
+    behavior_map = analyze_all(behavior_trajectories)
 
     # 3. Geofencing (same algorithm, source-appropriate zones)
     geo_list = run_geofencing(base_df, zones)
     geo_map  = {g["vessel_id"]: g for g in geo_list}
 
-    # 4. Feature extraction
-    feature_df = build_feature_matrix(base_df, trajectories, geo_map)
+    # 4. Feature extraction (now includes numeric behavioural features — M4)
+    feature_df = build_feature_matrix(base_df, trajectories, geo_map,
+                                      behavior_map=behavior_map)
 
     # 5. Isolation Forest anomaly detection
     anomaly_map = run_anomaly_detection(feature_df)
 
-    # 6. Risk engine
+    # 6. Risk engine (behaviour signals contribute + explain — M4)
     vessel_ids = base_df["vessel_id"].tolist()
-    risk_map   = run_risk_engine(vessel_ids, geo_map, feature_df, anomaly_map)
+    risk_map   = run_risk_engine(vessel_ids, geo_map, feature_df, anomaly_map,
+                                 behavior_map=behavior_map)
 
     # 7. Enrich base DataFrame with pipeline outputs
     df = base_df.copy()
@@ -254,6 +276,8 @@ def run_pipeline(source: str = "Simulated",
         "zone_label":     region_meta["zone_label"],
         "quality_report": quality_report,
         "positions_df":   positions_df,
+        "behavior_map":   behavior_map,
+        "map_trajectories": map_trajectories,
     }
 
     return df, alerts, anomaly_map, risk_map, feature_df, meta
@@ -563,6 +587,57 @@ with st.sidebar:
                   <span class="info-value">{val:.4f}</span>
                 </div>""", unsafe_allow_html=True)
 
+        # ── Behaviour Analysis for the selected vessel (M4) ──────────────
+        _beh = pipeline_meta.get("behavior_map", {}).get(selected_vessel)
+        if _beh:
+            st.markdown('<div class="section-header" style="margin-top:14px;">🧭 Behaviour Analysis</div>',
+                        unsafe_allow_html=True)
+            _beh_rows = [
+                ("Trajectory Duration", f"{_beh['trajectory_duration_minutes']:.0f} min"),
+                ("Position Count",      f"{_beh['position_count']}"),
+                ("Distance Travelled",  f"{_beh['distance_travelled_km']:.2f} km"),
+                ("Avg Speed",           f"{_beh['avg_speed']:.1f} kn"),
+                ("Max Speed",           f"{_beh['max_speed']:.1f} kn"),
+                ("Speed Variability",   f"{_beh['speed_std']:.2f}"),
+                ("Stationary Ratio",    f"{_beh['stationary_ratio']*100:.0f}%"),
+                ("Loitering Score",     f"{_beh['loitering_score']:.3f}"),
+                ("Mean Heading Change", f"{_beh['mean_heading_change']:.1f}°"),
+                ("Max AIS Gap",         f"{_beh['max_ais_gap_minutes']:.0f} min"),
+                ("Significant Gaps",    f"{_beh['significant_gap_count']}"),
+            ]
+            for label, val in _beh_rows:
+                st.markdown(f"""
+                <div class="info-row">
+                  <span class="info-label">{label}</span>
+                  <span class="info-value">{val}</span>
+                </div>""", unsafe_allow_html=True)
+            # Behaviour classification chips + plain-language summary
+            _chips = "".join(
+                f'<span style="display:inline-block;background:#13284a;'
+                f'border:1px solid #1e3a6e;color:#7fd4ff;border-radius:4px;'
+                f'padding:1px 6px;margin:2px 3px 0 0;font-size:0.66rem;">{lbl}</span>'
+                for lbl in _beh.get("behavior_labels", [])
+            )
+            st.markdown(f"""
+            <div style="margin-top:6px;">{_chips}</div>
+            <div style="font-size:0.72rem;color:#a0b8d8;margin-top:6px;line-height:1.5;">
+              {_beh.get('behavior_summary', '')}
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Risk Factors (explainable, M4) ───────────────────────────────
+        _rfactors = risk_result.get("risk_factors", [])
+        if _rfactors:
+            st.markdown('<div class="section-header" style="margin-top:14px;">🧾 Risk Factors</div>',
+                        unsafe_allow_html=True)
+            _rf_html = "".join(
+                f'<div style="font-size:0.75rem;color:#c8d6f0;padding:3px 0;'
+                f'border-bottom:1px solid #1a2840;">▸ {rf}</div>'
+                for rf in _rfactors
+            )
+            st.markdown(f'<div class="info-card" style="padding:10px 12px;">{_rf_html}</div>',
+                        unsafe_allow_html=True)
+
         # ── Recent history for this vessel (from SQLite, M3) ─────────────
         try:
             _vh = database.get_vessel_recent(selected_vessel, limit=5,
@@ -646,12 +721,17 @@ sel = selected_vessel if selected_vessel != "— Select a vessel —" else ""
 with map_col:
     st.markdown('<div class="section-header">🗺️ Live Vessel Tracking Map</div>',
                 unsafe_allow_html=True)
+    # In Historical AIS mode, overlay the selected vessel's REAL AIS track (M4).
+    _sel_traj = None
+    if sel and _active_source == "Historical AIS":
+        _sel_traj = pipeline_meta.get("map_trajectories", {}).get(sel)
     folium_map = build_map(
         df,
         selected_vessel=sel,
         zones=pipeline_meta["zones"],
         center=pipeline_meta["map_center"],
         zoom=pipeline_meta["map_zoom"],
+        selected_trajectory=_sel_traj,
     )
     st_folium(folium_map, width=None, height=560, returned_objects=[])
 

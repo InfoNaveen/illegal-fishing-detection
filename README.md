@@ -278,6 +278,38 @@ recent risk assessments) and the vessel inspector shows a per-vessel recent-hist
 
 ---
 
+## Behavioural Analysis
+
+IFDS derives explainable **behavioural indicators** from each vessel's ordered trajectory
+(`behavior_analysis.py`). These move the system beyond single-point/latest-position
+scoring toward trajectory-aware analysis that helps explain *why* a vessel may be
+suspicious. Indicators include:
+
+- **Distance travelled** (Haversine great-circle distance over consecutive positions)
+- **Speed statistics** — average, maximum, variability (std), and speed-change rate
+- **Heading / turning behaviour** — mean/max heading change (normalised to [-180, 180])
+  and a time-based turning rate
+- **Stationary ratio** — share of observations at or below a low-speed threshold (1.0 kn)
+- **Loitering score** [0, 1] — combines spatial containment (bounding-box spread vs
+  distance travelled) with stationarity; a vessel covering little net ground relative to
+  how far it moved, while slow, scores high
+- **AIS reporting gaps** — maximum and mean gap, and a count of significant gaps
+  (≥ 30 min) derived from timestamps
+- **Trajectory duration** and **position count**
+
+Each vessel also receives a transparent, non-ML, multi-label classification
+(`NORMAL_TRANSIT`, `SLOW_MOVEMENT`, `LOITERING`, `HIGH_TURNING`, `AIS_GAP`,
+`SPEED_ANOMALY`, `MIXED_SUSPICIOUS`, or `INSUFFICIENT_DATA`) and a plain-language summary.
+The numeric indicators are appended to the Isolation Forest feature matrix (numeric only),
+and the risk engine exposes an explainable `risk_factors` list per vessel. In Historical
+AIS mode the vessel inspector shows a Behaviour Analysis panel and the map draws the
+selected vessel's **actual** chronological AIS track.
+
+> These indicators identify **potentially suspicious maritime behaviour**. They do not
+> independently prove illegal fishing.
+
+---
+
 ## Technology Stack
 
 | Library | Purpose |
@@ -307,6 +339,7 @@ illegal-fishing-detection/
 ├── map_builder.py          # Folium map construction (zones, trails, markers, legend)
 ├── geofencing.py           # Point-in-polygon zone detection and proximity scoring
 ├── feature_engineering.py  # Behavioural feature extraction from trajectories
+├── behavior_analysis.py    # Trajectory & behaviour metrics + classification (M4)
 ├── anomaly_detector.py     # Isolation Forest model training and scoring
 ├── risk_engine.py          # Weighted risk scoring, classification, alert generation
 │
@@ -315,6 +348,7 @@ illegal-fishing-detection/
 ├── test_ais_loader.py      # Focused tests for the AIS ingestion layer
 ├── test_data_processing.py # Tests for AIS cleaning + zone configuration
 ├── test_database.py        # Tests for SQLite persistence (temp DB)
+├── test_behavior_analysis.py # Tests for trajectory & behaviour analysis
 ├── data/
 │   ├── ifds_ais_sample.csv # Historical AIS sample — Danish waters, 2025-02-27 (~100k rows)
 │   ├── ifds.db             # SQLite runtime history (git-ignored, created on first run)
@@ -462,12 +496,13 @@ Isolation Forest does not generalise beyond the data it was fitted on.
 - The default fleet is **simulated**; Historical AIS mode reads a **local CSV only** —
   there is still no live AIS feed or real-time data source
 - The bundled `data/sample_ais.csv` is a synthetic test fixture, not real AIS data
-- In Historical AIS mode the pipeline currently uses each vessel's **latest** position for
-  scoring; richer time-series trajectory analysis is future work
+- Behavioural indicators are now derived from each vessel's full ordered trajectory, but
+  anomaly scoring still uses the current (latest) position as the vessel row; deeper
+  sequence/temporal modelling (e.g. LSTM/GRU) is future work
 - Simulated fleet size is 18 vessels — too small for a statistically robust anomaly model
 - The Isolation Forest model is **re-fitted on every application run** — no persistent model
 - Risk weights and classification thresholds are prototype values, not domain-calibrated
-- No database — all state is in-memory and resets on restart
+- Persistence is a **local SQLite history sink**; it is not a live operational data store
 - No authentication or access control
 - No real-time alert delivery (email, SMS, etc.)
 - Simulated AIS gap durations are deterministic demo values, not computed from actual signal logs

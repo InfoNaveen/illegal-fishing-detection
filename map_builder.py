@@ -144,6 +144,39 @@ def _add_vessel_trails(fmap: folium.Map,
     return fmap
 
 
+def _add_selected_real_trajectory(fmap: folium.Map,
+                                  vessel_id: str,
+                                  trajectory: List[Tuple[float, float]]) -> folium.Map:
+    """
+    Draw the REAL chronological trajectory for the selected vessel (M4).
+
+    Used in Historical AIS mode so the selected vessel's actual AIS track is
+    shown instead of a synthetic trail. Points must already be ordered
+    chronologically. Start/end markers aid interpretation.
+    """
+    if not trajectory or len(trajectory) < 2:
+        return fmap
+
+    grp = folium.FeatureGroup(name=f"Selected Track ({vessel_id})", show=True)
+    folium.PolyLine(
+        locations=trajectory,
+        color="#00d4ff",
+        weight=3.0,
+        opacity=0.9,
+        tooltip=f"{vessel_id} actual AIS track ({len(trajectory)} points)",
+    ).add_to(grp)
+
+    # Start (green) and end (white) markers.
+    folium.CircleMarker(location=trajectory[0], radius=5, color="#2ECC71",
+                        fill=True, fill_color="#2ECC71", fill_opacity=0.9,
+                        tooltip=f"{vessel_id} track start").add_to(grp)
+    folium.CircleMarker(location=trajectory[-1], radius=5, color="#ffffff",
+                        fill=True, fill_color="#00d4ff", fill_opacity=0.9,
+                        tooltip=f"{vessel_id} track end (current)").add_to(grp)
+    grp.add_to(fmap)
+    return fmap
+
+
 # ---------------------------------------------------------------------------
 # Vessel markers
 # ---------------------------------------------------------------------------
@@ -273,7 +306,8 @@ def build_map(df: pd.DataFrame,
               selected_vessel: str = "",
               zones: List[Dict] = None,
               center: Tuple[float, float] = (12.5, 80.2),
-              zoom: int = 8) -> folium.Map:
+              zoom: int = 8,
+              selected_trajectory: List[Tuple[float, float]] = None) -> folium.Map:
     """
     Assemble and return the complete Folium map with:
     - Dark CartoDB base tiles
@@ -285,14 +319,19 @@ def build_map(df: pd.DataFrame,
 
     Parameters
     ----------
-    zones  : optional zone list (defaults to the simulated Bay of Bengal set).
-    center : map centre (lat, lon). Defaults to the Bay of Bengal.
-    zoom   : initial zoom level.
+    zones               : optional zone list (defaults to the simulated set).
+    center              : map centre (lat, lon). Defaults to the Bay of Bengal.
+    zoom                : initial zoom level.
+    selected_trajectory : optional list of (lat, lon) for the selected vessel's
+                          REAL chronological track (Historical AIS, M4). When
+                          provided, it is drawn as a highlighted overlay.
     """
     fmap = _create_base_map(center=center, zoom=zoom)
     fmap = _add_restricted_zones(fmap, zones)
     fmap = _add_vessel_trails(fmap, df)
     fmap = _add_vessel_markers(fmap, df, selected_vessel)
+    if selected_vessel and selected_trajectory:
+        fmap = _add_selected_real_trajectory(fmap, selected_vessel, selected_trajectory)
     fmap = _add_legend(fmap)
     folium.LayerControl(collapsed=False).add_to(fmap)
     return fmap
