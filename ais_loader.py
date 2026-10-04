@@ -41,7 +41,11 @@ import pandas as pd
 
 # Repository-relative default path. The application handles the file not
 # existing — see app.py integration. No machine-specific absolute paths.
-DEFAULT_AIS_CSV_PATH: str = os.path.join("data", "sample_ais.csv")
+#
+# This points at the historical AIS sample (Danish Maritime Authority AIS data,
+# 2025-02-27). The tiny synthetic data/sample_ais.csv is retained ONLY for the
+# automated test suite (test_ais_loader.py references it directly).
+DEFAULT_AIS_CSV_PATH: str = os.path.join("data", "ifds_ais_sample.csv")
 
 # Normalized internal column names the rest of the application expects.
 NORMALIZED_COLUMNS: List[str] = [
@@ -213,7 +217,11 @@ def _coerce_and_validate(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── timestamp ─────────────────────────────────────────────────────────────
     if "timestamp" in work.columns:
-        work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce")
+        # dayfirst=True handles DD/MM/YYYY sources (e.g. Danish AIS exports)
+        # while still parsing ISO timestamps correctly.
+        work["timestamp"] = pd.to_datetime(
+            work["timestamp"], errors="coerce", dayfirst=True
+        )
         # Drop rows whose timestamp could not be parsed.
         work = work[work["timestamp"].notna()]
     else:
