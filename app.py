@@ -27,7 +27,7 @@ from data_generator import (
 )
 from geofencing import run_geofencing
 from feature_engineering import build_feature_matrix
-from anomaly_detector import run_anomaly_detection
+from anomaly_detector import run_anomaly_detection, run_anomaly_detection_with_status
 from risk_engine import run_risk_engine, generate_alerts
 from map_builder import build_map
 
@@ -248,8 +248,9 @@ def run_pipeline(source: str = "Simulated",
     feature_df = build_feature_matrix(base_df, trajectories, geo_map,
                                       behavior_map=behavior_map)
 
-    # 5. Isolation Forest anomaly detection
-    anomaly_map = run_anomaly_detection(feature_df)
+    # 5. Isolation Forest anomaly detection (persistent model — M5)
+    anomaly_map, model_status, model_meta = run_anomaly_detection_with_status(
+        feature_df)
 
     # 6. Risk engine (behaviour signals contribute + explain — M4)
     vessel_ids = base_df["vessel_id"].tolist()
@@ -278,6 +279,8 @@ def run_pipeline(source: str = "Simulated",
         "positions_df":   positions_df,
         "behavior_map":   behavior_map,
         "map_trajectories": map_trajectories,
+        "model_status":   model_status,
+        "model_meta":     model_meta,
     }
 
     return df, alerts, anomaly_map, risk_map, feature_df, meta
@@ -448,6 +451,24 @@ with st.sidebar:
             '● Using built-in simulated fleet</div>',
             unsafe_allow_html=True,
         )
+
+    # ── ML model status (M5) ─────────────────────────────────────────────
+    _ms = pipeline_meta.get("model_status", "ready")
+    _ms_label = {
+        "loaded":    ("● Loaded existing model", "#2ECC71"),
+        "trained":   ("● Trained new model",      "#00d4ff"),
+        "retrained": ("● Retrained model (schema changed)", "#FF8C00"),
+        "in-memory": ("● In-memory model",         "#8899bb"),
+    }.get(_ms, ("● Model ready", "#8899bb"))
+    st.markdown('<div class="section-header">🤖 ML Model</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="font-size:0.7rem;color:{_ms_label[1]};margin:-4px 0 4px;">'
+        f'{_ms_label[0]}</div>'
+        f'<div style="font-size:0.64rem;color:#4a6a9a;margin-bottom:10px;">'
+        f'Isolation Forest · unsupervised anomaly detection</div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
                 unsafe_allow_html=True)
@@ -691,7 +712,7 @@ st.markdown(f"""
     <div style="font-size:0.68rem;color:#2a5080;">SYSTEM STATUS</div>
     <div style="color:#2ECC71;font-weight:700;font-size:0.9rem;">● OPERATIONAL</div>
     <div style="font-size:0.65rem;color:#2a5080;margin-top:2px;">
-      ISOLATION FOREST · LIVE PIPELINE
+      ISOLATION FOREST · MODEL {pipeline_meta.get('model_status', 'ready').upper()}
     </div>
   </div>
 </div>

@@ -52,3 +52,8 @@ data/ifds.db
 *.db
 *.sqlite
 *.sqlite3
+
+# Persistent ML model artifacts (runtime-generated — not committed)
+models/
+*.joblib
+*.pkl

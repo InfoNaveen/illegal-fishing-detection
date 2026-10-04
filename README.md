@@ -340,7 +340,8 @@ illegal-fishing-detection/
 ├── geofencing.py           # Point-in-polygon zone detection and proximity scoring
 ├── feature_engineering.py  # Behavioural feature extraction from trajectories
 ├── behavior_analysis.py    # Trajectory & behaviour metrics + classification (M4)
-├── anomaly_detector.py     # Isolation Forest model training and scoring
+├── anomaly_detector.py     # Isolation Forest scoring (train-once / load-reuse)
+├── model_manager.py        # Persistent model lifecycle: train/save/load/compat (M5)
 ├── risk_engine.py          # Weighted risk scoring, classification, alert generation
 │
 ├── database.py             # SQLite persistence layer (local history sink)
@@ -349,14 +350,17 @@ illegal-fishing-detection/
 ├── test_data_processing.py # Tests for AIS cleaning + zone configuration
 ├── test_database.py        # Tests for SQLite persistence (temp DB)
 ├── test_behavior_analysis.py # Tests for trajectory & behaviour analysis
+├── test_model_manager.py   # Tests for persistent model lifecycle (temp artifacts)
 ├── data/
 │   ├── ifds_ais_sample.csv # Historical AIS sample — Danish waters, 2025-02-27 (~100k rows)
 │   ├── ifds.db             # SQLite runtime history (git-ignored, created on first run)
 │   ├── sample_ais.csv      # Tiny synthetic TEST FIXTURE (not real AIS data)
 │   └── README.md           # Notes on the data directory and real AIS usage
+├── models/                 # Trained model artifact (git-ignored, created on first run)
+│   └── isolation_forest.joblib
 │
 ├── requirements.txt        # Pinned Python dependencies
-├── .gitignore              # Excludes venv, __pycache__, secrets, raw datasets
+├── .gitignore              # Excludes venv, __pycache__, secrets, raw datasets, models
 └── README.md               # This file
 ```
 
@@ -478,8 +482,10 @@ The system uses **Isolation Forest**, an unsupervised anomaly detection algorith
 well-suited to small, unlabelled datasets.
 
 **How it works in this system:**
-1. A 18×9 feature matrix is constructed from the vessel fleet (18 vessels, 9 features each)
-2. An Isolation Forest model is fitted on this matrix during each pipeline run
+1. A feature matrix is constructed from the vessel fleet (the 9 base features plus the
+   12 M4 behavioural features = 21 columns per vessel)
+2. An Isolation Forest model scores the matrix — trained once and then reused from a saved
+   artifact on later runs (see Persistent ML Model below)
 3. The model's `decision_function` scores each vessel — vessels that are harder to
    isolate (require more splits) score as more normal
 4. Scores are inverted and min-max normalised to `[0, 1]`
@@ -488,6 +494,30 @@ well-suited to small, unlabelled datasets.
 **Important:** No labelled training data (confirmed illegal fishing cases) is used. The
 model identifies statistical outliers within the current fleet, not absolute criminality.
 Isolation Forest does not generalise beyond the data it was fitted on.
+
+### Persistent ML Model
+
+The Isolation Forest is **unsupervised** and follows a train-once / reuse lifecycle
+(`model_manager.py`, serialized with `joblib`):
+
+- On the first run (or when no compatible artifact exists) the model is **trained** on the
+  current feature matrix and saved to `models/isolation_forest.joblib`.
+- On subsequent runs a **compatible saved artifact is loaded and reused** — the model is
+  not re-fitted, which avoids repeated training cost.
+- Before reuse, the artifact is validated against the current feature pipeline: it must
+  deserialize cleanly, carry metadata, and match the feature **count**, **names**, and
+  **order**, plus the model version. Any mismatch — or a corrupted artifact — triggers a
+  safe **retrain** that overwrites the invalid file; the pipeline never crashes.
+- The saved artifact bundles the fitted model, the fitted scaler, and metadata
+  (`feature_columns`, `feature_count`, `random_state`, `contamination`, `n_estimators`,
+  `trained_at`, `model_version`). Configuration is unchanged: 200 estimators,
+  contamination 0.20, random_state 42.
+- The dashboard reports whether the current run **loaded** or **trained** the model.
+
+The model artifact is **local and git-ignored** (`models/`); it is never committed, never
+stored in SQLite, and the raw AIS dataset is never used for training. No labelled
+illegal-fishing ground truth exists, so this remains anomaly detection — no accuracy,
+precision, recall, or F1 is claimed.
 
 ---
 
@@ -500,7 +530,8 @@ Isolation Forest does not generalise beyond the data it was fitted on.
   anomaly scoring still uses the current (latest) position as the vessel row; deeper
   sequence/temporal modelling (e.g. LSTM/GRU) is future work
 - Simulated fleet size is 18 vessels — too small for a statistically robust anomaly model
-- The Isolation Forest model is **re-fitted on every application run** — no persistent model
+- The Isolation Forest model is trained once and reused from a saved artifact; it retrains
+  only when the artifact is missing, corrupted, or incompatible with the feature schema
 - Risk weights and classification thresholds are prototype values, not domain-calibrated
 - Persistence is a **local SQLite history sink**; it is not a live operational data store
 - No authentication or access control
