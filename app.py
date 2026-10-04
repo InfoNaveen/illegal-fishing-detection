@@ -40,6 +40,9 @@ from ais_loader import (
     AISFileError,
     AISColumnError,
 )
+# ── Round 3 M2: AIS cleaning + regional zone configuration ──────────────────
+from data_processing import clean_ais_dataframe
+from zones import get_zones, get_region_meta
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -182,25 +185,32 @@ def run_pipeline(source: str = "Simulated",
     anomaly_map : {vessel_id: {anomaly_score, is_anomalous}}
     risk_map    : {vessel_id: risk_result_dict}
     feature_df  : feature DataFrame (used by ML details panel)
+    meta        : dict of source metadata (zones, region, data-quality report)
 
     Notes
     -----
-    Only steps 1 and 2 (raw data + trajectories) differ between the two
-    sources. Everything from geofencing onward is identical and unchanged.
+    Only the raw-data + trajectory stage and the zone configuration differ
+    between the two sources. Everything from geofencing onward is identical and
+    unchanged. The simulated path is untouched.
     """
-    zones = get_restricted_zones()
+    # Zone configuration is source-aware (zones.py). Geofencing algorithm
+    # itself is unchanged.
+    zones = get_zones(source)
+    quality_report: dict = {}
 
     # 1 + 2. Raw vessel data + trajectories (source-dependent).
     if source == "Historical AIS":
-        ais_df       = load_vessel_dataframe(csv_path)       # may raise AISFileError/AISColumnError
-        trajectories = build_trajectories_from_ais(ais_df)   # full multi-point tracks
-        base_df      = summarize_latest_positions(ais_df)    # one current row per vessel
+        ais_df = load_vessel_dataframe(csv_path)             # may raise AISFileError/AISColumnError
+        # M2: deterministic cleaning between ingestion and the pipeline.
+        clean_df, quality_report = clean_ais_dataframe(ais_df)
+        trajectories = build_trajectories_from_ais(clean_df) # full multi-point tracks (cleaned)
+        base_df      = summarize_latest_positions(clean_df)  # one current row per vessel
     else:
         # Default simulated path — unchanged from Round 2.
         base_df      = generate_vessel_dataframe()
         trajectories = build_all_trajectories(base_df)
 
-    # 3. Geofencing
+    # 3. Geofencing (same algorithm, source-appropriate zones)
     geo_list = run_geofencing(base_df, zones)
     geo_map  = {g["vessel_id"]: g for g in geo_list}
 
@@ -224,7 +234,18 @@ def run_pipeline(source: str = "Simulated",
     # 8. Dynamic alerts
     alerts = generate_alerts(risk_map)
 
-    return df, alerts, anomaly_map, risk_map, feature_df
+    region_meta = get_region_meta(source)
+    meta = {
+        "source":         source,
+        "zones":          zones,
+        "region":         region_meta["region"],
+        "map_center":     region_meta["map_center"],
+        "map_zoom":       region_meta["map_zoom"],
+        "zone_label":     region_meta["zone_label"],
+        "quality_report": quality_report,
+    }
+
+    return df, alerts, anomaly_map, risk_map, feature_df, meta
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +259,7 @@ _active_source = st.session_state["data_source"]
 _ais_error_message = ""
 
 try:
-    df, alerts, anomaly_map, risk_map, feature_df = run_pipeline(
+    df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
         source=_active_source,
         csv_path=DEFAULT_AIS_CSV_PATH,
     )
@@ -247,7 +268,7 @@ except (AISFileError, AISColumnError) as exc:
     # dashboard never crashes, and surface a clear message in the sidebar.
     _ais_error_message = str(exc)
     _active_source = "Simulated"
-    df, alerts, anomaly_map, risk_map, feature_df = run_pipeline(
+    df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
         source="Simulated",
         csv_path=DEFAULT_AIS_CSV_PATH,
     )
@@ -301,11 +322,44 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     if _active_source == "Historical AIS" and not _ais_error_message:
+        _qr = pipeline_meta.get("quality_report", {})
         st.markdown(
-            '<div style="font-size:0.68rem;color:#2ECC71;margin:-4px 0 10px;">'
+            '<div style="font-size:0.68rem;color:#2ECC71;margin:-4px 0 6px;">'
             '● Historical AIS loaded</div>',
             unsafe_allow_html=True,
         )
+        st.markdown(f"""
+        <div class="info-card" style="padding:10px 12px;margin-bottom:10px;">
+          <div class="info-row">
+            <span class="info-label">Region</span>
+            <span class="info-value">{pipeline_meta.get('region', 'Danish Waters')}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Dataset</span>
+            <span class="info-value" style="font-size:0.72rem;">2025-02-27 Historical AIS</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Records (raw)</span>
+            <span class="info-value">{_qr.get('input_rows', 0):,}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Records (clean)</span>
+            <span class="info-value">{_qr.get('output_rows', 0):,}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">Rows removed</span>
+            <span class="info-value">{_qr.get('rows_removed', 0):,}</span>
+          </div>
+          <div class="info-row" style="border-bottom:none;">
+            <span class="info-label">Vessels</span>
+            <span class="info-value">{_qr.get('unique_vessels', 0):,}</span>
+          </div>
+        </div>
+        <div style="font-size:0.62rem;color:#5a7aa5;margin:-4px 0 10px;line-height:1.5;">
+          Demonstration monitoring zones over Danish waters — not legally
+          restricted areas. Movement data only; not proof of illegal fishing.
+        </div>
+        """, unsafe_allow_html=True)
     elif _ais_error_message:
         st.warning(
             "Historical AIS dataset not found or invalid. "
@@ -471,7 +525,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 # ── Page header ─────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div style="display:flex;align-items:center;gap:16px;
             padding:18px 24px;margin-bottom:20px;
             background:linear-gradient(90deg,#0a1830 0%,#080c1a 100%);
@@ -482,7 +536,7 @@ st.markdown("""
       Illegal Fishing Detection System
     </div>
     <div style="font-size:0.78rem;color:#4a6a9a;letter-spacing:0.1em;margin-top:2px;">
-      MARITIME VESSEL MONITORING · BAY OF BENGAL · ANOMALY DETECTION PROTOTYPE
+      MARITIME VESSEL MONITORING · {pipeline_meta.get('region', 'Bay of Bengal').upper()} · ANOMALY DETECTION PROTOTYPE
     </div>
   </div>
   <div style="margin-left:auto;text-align:right;">
@@ -519,7 +573,13 @@ sel = selected_vessel if selected_vessel != "— Select a vessel —" else ""
 with map_col:
     st.markdown('<div class="section-header">🗺️ Live Vessel Tracking Map</div>',
                 unsafe_allow_html=True)
-    folium_map = build_map(df, selected_vessel=sel)
+    folium_map = build_map(
+        df,
+        selected_vessel=sel,
+        zones=pipeline_meta["zones"],
+        center=pipeline_meta["map_center"],
+        zoom=pipeline_meta["map_zoom"],
+    )
     st_folium(folium_map, width=None, height=560, returned_objects=[])
 
 with panel_col:

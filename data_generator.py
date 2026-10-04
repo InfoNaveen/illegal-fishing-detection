@@ -205,8 +205,17 @@ def build_all_trajectories(vessel_df: pd.DataFrame) -> Dict[str, List[Tuple[floa
 # ---------------------------------------------------------------------------
 
 def get_restricted_zones() -> List[Dict]:
-    """Return the list of restricted zone definitions."""
-    return RESTRICTED_ZONES
+    """
+    Return the restricted zone definitions for the simulated (Bay of Bengal)
+    environment.
+
+    Zone configuration now lives in zones.py so it can be selected per data
+    source. This accessor delegates to the simulated zone set to preserve the
+    existing contract (and the module-level RESTRICTED_ZONES constant above is
+    retained for backward compatibility / direct imports).
+    """
+    from zones import get_zones
+    return get_zones("Simulated")
 
 
 # ---------------------------------------------------------------------------

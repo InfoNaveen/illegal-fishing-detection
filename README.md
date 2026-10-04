@@ -187,21 +187,63 @@ If a **required** column cannot be resolved, the loader raises a clear error nam
 missing field. Rows with invalid coordinates (latitude outside ±90, longitude outside
 ±180, or non-numeric) are dropped — never fabricated.
 
+The bundled historical sample uses `DD/MM/YYYY HH:MM:SS` timestamps, which the cleaning
+stage parses explicitly (day-first) to avoid ambiguity.
+
 #### Configuring the AIS CSV
 
-Place a CSV at the repository-relative default path:
+Historical AIS mode reads, by default, the repository-relative path:
 
 ```
-data/sample_ais.csv
+data/ifds_ais_sample.csv
 ```
 
-The bundled `data/sample_ais.csv` is a **tiny synthetic test fixture** (vessel IDs
-`TEST001`…) used only for automated tests and to let Historical AIS mode start without an
-external download. It is **not** real AIS data. To use genuine data, replace that file
-with a historical AIS CSV from a public maritime open-data source.
+`data/ifds_ais_sample.csv` is a **historical AIS sample from Danish waters** (Danish
+Maritime Authority AIS data, 2025-02-27): ~100,000 records across ~2,107 vessels. It is
+historical movement data, not a live feed. A separate tiny synthetic fixture,
+`data/sample_ais.csv` (vessel IDs `TEST001`…), is retained **only** for the automated test
+suite and is never presented as real AIS data.
 
-If the file is missing or invalid, the dashboard shows a clear message and automatically
-falls back to Simulated mode — it never crashes.
+If the configured file is missing or invalid, the dashboard shows a clear message and
+automatically falls back to Simulated mode — it never crashes.
+
+#### Data cleaning (preprocessing)
+
+Historical AIS records pass through a deterministic cleaning stage (`data_processing.py`)
+before the detection pipeline:
+
+```
+historical CSV → ais_loader → data_processing → trajectories → detection pipeline
+```
+
+The cleaning stage normalises timestamps, coerces numeric fields, drops rows with
+missing/out-of-range coordinates or missing vessel IDs, removes negative (physically
+invalid) speeds, normalises heading to `[0, 360)` (treating `0` as a valid direction and
+the AIS `511` value as "not available"), and removes **exact** duplicate
+`(vessel_id, timestamp, latitude, longitude)` records. It does **not** interpolate,
+resample, reconstruct, or infer anything, and never fabricates movement values. It returns
+a deterministic data-quality report (input/output rows, rows removed by category, unique
+vessels), which the dashboard surfaces in Historical AIS mode.
+
+> On the bundled Danish sample, cleaning removes a large number of **exact-duplicate
+> broadcasts** (common for moored/anchored vessels and redundant feed records) while
+> preserving every vessel. This is expected and is not data loss.
+
+### Monitoring / restricted zones (configurable)
+
+Geofencing zones are **configurable per data source** (`zones.py`) — the ray-casting
+geofencing algorithm itself is unchanged and shared by both modes:
+
+- **Simulated** → Bay of Bengal **demonstration restricted zones** (for the synthetic
+  fleet). Unchanged from earlier rounds.
+- **Historical AIS** → Danish-waters **demonstration monitoring zones**, placed over
+  regions where the sample dataset actually has dense vessel traffic (Øresund, Skagerrak,
+  North Sea).
+
+> The Danish polygons are **demonstration monitoring zones only**. They are **not**
+> authoritative Danish restricted, protected, or fishing-closure areas, and must not be
+> interpreted as legally restricted waters. They exist solely to exercise the geofencing
+> pipeline against real vessel positions.
 
 ---
 
@@ -229,6 +271,8 @@ illegal-fishing-detection/
 ├── app.py                  # Streamlit dashboard — UI and pipeline orchestration
 ├── data_generator.py       # Simulated vessel fleet, trajectory generation, AIS gap data
 ├── ais_loader.py           # Historical AIS CSV ingestion + normalisation (Historical AIS mode)
+├── data_processing.py      # Deterministic AIS cleaning + data-quality report (Historical AIS mode)
+├── zones.py                # Source-aware zone configuration (Bay of Bengal / Danish demo)
 ├── map_builder.py          # Folium map construction (zones, trails, markers, legend)
 ├── geofencing.py           # Point-in-polygon zone detection and proximity scoring
 ├── feature_engineering.py  # Behavioural feature extraction from trajectories
@@ -236,12 +280,14 @@ illegal-fishing-detection/
 ├── risk_engine.py          # Weighted risk scoring, classification, alert generation
 │
 ├── test_ais_loader.py      # Focused tests for the AIS ingestion layer
+├── test_data_processing.py # Tests for AIS cleaning + zone configuration
 ├── data/
+│   ├── ifds_ais_sample.csv # Historical AIS sample — Danish waters, 2025-02-27 (~100k rows)
 │   ├── sample_ais.csv      # Tiny synthetic TEST FIXTURE (not real AIS data)
 │   └── README.md           # Notes on the data directory and real AIS usage
 │
 ├── requirements.txt        # Pinned Python dependencies
-├── .gitignore              # Excludes venv, __pycache__, secrets, data files
+├── .gitignore              # Excludes venv, __pycache__, secrets, raw datasets
 └── README.md               # This file
 ```
 

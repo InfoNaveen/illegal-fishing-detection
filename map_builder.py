@@ -63,10 +63,12 @@ def _create_base_map(center: Tuple[float, float] = (12.5, 80.2),
 # Restricted zones
 # ---------------------------------------------------------------------------
 
-def _add_restricted_zones(fmap: folium.Map) -> folium.Map:
-    """Draw restricted fishing zone polygons onto the map."""
-    zones = get_restricted_zones()
-    zone_group = folium.FeatureGroup(name="Restricted Zones", show=True)
+def _add_restricted_zones(fmap: folium.Map,
+                          zones: List[Dict] = None) -> folium.Map:
+    """Draw restricted/monitoring zone polygons onto the map."""
+    if zones is None:
+        zones = get_restricted_zones()
+    zone_group = folium.FeatureGroup(name="Monitoring / Restricted Zones", show=True)
 
     for zone in zones:
         # Polygon fill
@@ -267,18 +269,28 @@ def _add_legend(fmap: folium.Map) -> folium.Map:
 # Public API
 # ---------------------------------------------------------------------------
 
-def build_map(df: pd.DataFrame, selected_vessel: str = "") -> folium.Map:
+def build_map(df: pd.DataFrame,
+              selected_vessel: str = "",
+              zones: List[Dict] = None,
+              center: Tuple[float, float] = (12.5, 80.2),
+              zoom: int = 8) -> folium.Map:
     """
     Assemble and return the complete Folium map with:
     - Dark CartoDB base tiles
-    - Restricted zone polygons + labels
+    - Restricted / monitoring zone polygons + labels
     - Vessel movement trails
     - Vessel markers with popups
     - Layer control
     - Legend
+
+    Parameters
+    ----------
+    zones  : optional zone list (defaults to the simulated Bay of Bengal set).
+    center : map centre (lat, lon). Defaults to the Bay of Bengal.
+    zoom   : initial zoom level.
     """
-    fmap = _create_base_map()
-    fmap = _add_restricted_zones(fmap)
+    fmap = _create_base_map(center=center, zoom=zoom)
+    fmap = _add_restricted_zones(fmap, zones)
     fmap = _add_vessel_trails(fmap, df)
     fmap = _add_vessel_markers(fmap, df, selected_vessel)
     fmap = _add_legend(fmap)
