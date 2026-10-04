@@ -48,6 +48,8 @@ import database
 from database import DatabaseError, DEFAULT_DB_PATH
 # ── Round 3 M4: trajectory & behaviour analysis ─────────────────────────────
 from behavior_analysis import analyze_all
+# ── Round 3 M6: temporal sequence anomaly detection ─────────────────────────
+from temporal_model_manager import run_temporal_detection
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -240,6 +242,16 @@ def run_pipeline(source: str = "Simulated",
     # 2b. Behaviour analysis (M4) — per-vessel, operates on ordered tracks.
     behavior_map = analyze_all(behavior_trajectories)
 
+    # 2c. Temporal sequence tracks (M6). Historical AIS already has time-aware
+    # DataFrame slices; simulated tuple trajectories become minimal DataFrames.
+    if source == "Historical AIS":
+        temporal_tracks = behavior_trajectories
+    else:
+        temporal_tracks = {
+            str(vid): pd.DataFrame(pts, columns=["latitude", "longitude"])
+            for vid, pts in behavior_trajectories.items()
+        }
+
     # 3. Geofencing (same algorithm, source-appropriate zones)
     geo_list = run_geofencing(base_df, zones)
     geo_map  = {g["vessel_id"]: g for g in geo_list}
@@ -251,6 +263,10 @@ def run_pipeline(source: str = "Simulated",
     # 5. Isolation Forest anomaly detection (persistent model — M5)
     anomaly_map, model_status, model_meta = run_anomaly_detection_with_status(
         feature_df)
+
+    # 5b. Temporal sequence anomaly detection (persistent model — M6)
+    temporal_map, temporal_status, temporal_meta = run_temporal_detection(
+        temporal_tracks)
 
     # 6. Risk engine (behaviour signals contribute + explain — M4)
     vessel_ids = base_df["vessel_id"].tolist()
@@ -281,6 +297,9 @@ def run_pipeline(source: str = "Simulated",
         "map_trajectories": map_trajectories,
         "model_status":   model_status,
         "model_meta":     model_meta,
+        "temporal_map":   temporal_map,
+        "temporal_status": temporal_status,
+        "temporal_meta":  temporal_meta,
     }
 
     return df, alerts, anomaly_map, risk_map, feature_df, meta
@@ -460,13 +479,23 @@ with st.sidebar:
         "retrained": ("● Retrained model (schema changed)", "#FF8C00"),
         "in-memory": ("● In-memory model",         "#8899bb"),
     }.get(_ms, ("● Model ready", "#8899bb"))
-    st.markdown('<div class="section-header">🤖 ML Model</div>',
+    _ts = pipeline_meta.get("temporal_status", "ready")
+    _ts_label = {
+        "loaded":    ("● Temporal model loaded", "#2ECC71"),
+        "trained":   ("● Temporal model trained", "#00d4ff"),
+        "retrained": ("● Temporal model retrained", "#FF8C00"),
+    }.get(_ts, ("● Temporal model ready", "#8899bb"))
+    st.markdown('<div class="section-header">🤖 ML Models</div>',
                 unsafe_allow_html=True)
     st.markdown(
-        f'<div style="font-size:0.7rem;color:{_ms_label[1]};margin:-4px 0 4px;">'
+        f'<div style="font-size:0.7rem;color:{_ms_label[1]};margin:-4px 0 2px;">'
         f'{_ms_label[0]}</div>'
+        f'<div style="font-size:0.64rem;color:#4a6a9a;margin-bottom:4px;">'
+        f'Isolation Forest · point anomaly</div>'
+        f'<div style="font-size:0.7rem;color:{_ts_label[1]};margin:0 0 2px;">'
+        f'{_ts_label[0]}</div>'
         f'<div style="font-size:0.64rem;color:#4a6a9a;margin-bottom:10px;">'
-        f'Isolation Forest · unsupervised anomaly detection</div>',
+        f'PCA sequence autoencoder · temporal anomaly</div>',
         unsafe_allow_html=True,
     )
 
@@ -482,6 +511,9 @@ with st.sidebar:
         risk_colour = _RISK_COLOURS.get(row["risk_level"], "#888")
         risk_result = risk_map[selected_vessel]
         anom        = anomaly_map[selected_vessel]
+        _temporal   = pipeline_meta.get("temporal_map", {}).get(
+            selected_vessel, {"temporal_anomaly_score": 0.0,
+                              "temporal_model_status": "insufficient_data"})
 
         st.markdown(f"""
         <div class="info-card">
@@ -531,6 +563,13 @@ with st.sidebar:
             <span class="info-value" style="color:#a78bfa;">
               {anom['anomaly_score']:.3f}
               {"  🔺" if anom['is_anomalous'] else ""}
+            </span>
+          </div>
+          <div class="info-row" style="border-bottom:none;">
+            <span class="info-label">Temporal Anomaly</span>
+            <span class="info-value" style="color:#7fd4ff;">
+              {_temporal['temporal_anomaly_score']:.3f}
+              {"" if _temporal['temporal_model_status'] == "scored" else "  (n/a)"}
             </span>
           </div>
           {f'''<div class="info-row" style="border-bottom:none;margin-top:4px;">
