@@ -268,10 +268,12 @@ def run_pipeline(source: str = "Simulated",
     temporal_map, temporal_status, temporal_meta = run_temporal_detection(
         temporal_tracks)
 
-    # 6. Risk engine (behaviour signals contribute + explain — M4)
+    # 6. Unified risk engine (geofence + isolation + temporal + behaviour +
+    #    AIS gap, each counted once — M7)
     vessel_ids = base_df["vessel_id"].tolist()
     risk_map   = run_risk_engine(vessel_ids, geo_map, feature_df, anomaly_map,
-                                 behavior_map=behavior_map)
+                                 behavior_map=behavior_map,
+                                 temporal_map=temporal_map)
 
     # 7. Enrich base DataFrame with pipeline outputs
     df = base_df.copy()

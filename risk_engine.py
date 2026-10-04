@@ -1,256 +1,238 @@
 """
 risk_engine.py
-Dynamic risk scoring engine for the Illegal Fishing Detection System.
+Unified vessel risk scoring engine for the Illegal Fishing Detection System.
 
-Combines:
-  - Geofencing result       (zone violation / proximity)
-  - Behavioural features    (loitering, speed anomaly, erratic movement)
-  - Isolation Forest score  (overall anomaly)
+Round 3 — Milestone M7
+----------------------
+This is the SINGLE canonical risk decision layer. It combines five normalised
+[0, 1] components, each counted EXACTLY ONCE, using documented weights:
 
-Produces per vessel:
-  risk_score   : int 0–100
-  risk_level   : "LOW" | "MEDIUM" | "HIGH"
-  behavior     : human-readable primary behaviour label
-  factors      : list of {factor, score, weight} dicts for the breakdown panel
-  zone_status  : human-readable zone status string
+    overall = 100 * ( w_geofence  * geofence_component
+                    + w_isolation * isolation_component
+                    + w_temporal  * temporal_component
+                    + w_behaviour * behaviour_component
+                    + w_ais_gap   * ais_gap_component )
 
-Weights are intentionally transparent and explainable.
+Component definitions (all normalised to [0, 1])
+------------------------------------------------
+geofence   : 1.0 inside a zone; proximity fraction when near; else 0.0
+isolation  : Isolation Forest normalised anomaly score (M5)
+temporal   : temporal sequence anomaly score (M6); 0.0 when unavailable
+behaviour  : max of loitering / speed-deviation / erratic / turning indicators
+ais_gap    : a SINGLE unified AIS-gap signal — max of the simulated per-vessel
+             gap and the trajectory-derived gap, scaled by 60 min. This removes
+             the earlier triple-counting of AIS gaps.
+
+Honesty note
+------------
+Unsupervised anomaly / suspicious-behaviour scoring. Factors are phrased as
+"suspicious fishing-related behaviour indicators" — never as confirmed illegal
+fishing. No labelled ground truth; no accuracy is claimed.
 """
 
-import math
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # ---------------------------------------------------------------------------
-# Component weights  (must sum ≤ 100 — remainder is baseline)
+# Component weights (sum to 1.0 — documented, each signal counted once)
 # ---------------------------------------------------------------------------
 
-W_ZONE_VIOLATION  = 40   # hard inside a restricted zone
-W_ZONE_PROXIMITY  = 15   # within PROXIMITY_THRESHOLD of a zone
-W_LOITERING       = 20   # loitering_score contribution
-W_SPEED_ANOMALY   = 12   # speed_deviation contribution
-W_ERRATIC         = 10   # erratic_score contribution
-W_ML_ANOMALY      = 25   # Isolation Forest normalised anomaly_score
-W_COMBO_BOOST     = 8    # bonus when loitering+erratic both elevated (suspicious combo)
-W_AIS_GAP         = 10   # AIS signal gap detected
-# Maximum possible raw sum = 40+15+20+12+10+25+8+10 = 140 → normalise to 100
-
-RAW_MAX = W_ZONE_VIOLATION + W_ZONE_PROXIMITY + W_LOITERING + \
-          W_SPEED_ANOMALY + W_ERRATIC + W_ML_ANOMALY + W_COMBO_BOOST + W_AIS_GAP
+W_GEOFENCE   = 0.30
+W_ISOLATION  = 0.25
+W_TEMPORAL   = 0.15
+W_BEHAVIOUR  = 0.20
+W_AIS_GAP    = 0.10
+# Sum = 1.00
 
 # ---------------------------------------------------------------------------
-# Risk thresholds
+# Thresholds
 # ---------------------------------------------------------------------------
 
 HIGH_THRESHOLD   = 55
 MEDIUM_THRESHOLD = 20
 
+# AIS-gap normalisation reference (minutes → full component at 60 min)
+AIS_GAP_FULL_MINUTES = 60.0
+AIS_GAP_MIN_MINUTES  = 20.0   # below this, no AIS-gap contribution
+
 
 # ---------------------------------------------------------------------------
-# Behaviour label derivation
+# Component computation (each returns a value in [0, 1])
+# ---------------------------------------------------------------------------
+
+def _geofence_component(geo: Dict, feat: Dict) -> float:
+    if geo.get("inside"):
+        return 1.0
+    if geo.get("near"):
+        return float(min(max(feat.get("zone_proximity_norm", 0.0), 0.0), 1.0))
+    return 0.0
+
+
+def _isolation_component(anomaly: Dict) -> float:
+    return float(min(max(anomaly.get("anomaly_score", 0.0), 0.0), 1.0))
+
+
+def _temporal_component(temporal: Dict) -> float:
+    if not temporal or temporal.get("temporal_model_status") != "scored":
+        return 0.0
+    return float(min(max(temporal.get("temporal_anomaly_score", 0.0), 0.0), 1.0))
+
+
+def _behaviour_component(feat: Dict, behavior: Dict) -> float:
+    """Max of the behavioural indicators (loitering, speed dev, erratic, turning)."""
+    loiter   = float(feat.get("loitering_score", 0.0))
+    spd_dev  = float(feat.get("speed_deviation", 0.0))
+    erratic  = float(feat.get("erratic_score", 0.0))
+    turn     = float(behavior.get("mean_heading_change", 0.0)) / 120.0  # 120° → 1.0
+    return float(min(max(max(loiter, spd_dev, erratic, turn), 0.0), 1.0))
+
+
+def _ais_gap_minutes_unified(ais_gap_minutes: float, behavior: Dict) -> float:
+    """Single unified gap in minutes = max(simulated gap, trajectory gap)."""
+    traj_gap = float(behavior.get("max_ais_gap_minutes", 0.0))
+    return max(float(ais_gap_minutes or 0.0), traj_gap)
+
+
+def _ais_gap_component(gap_minutes: float) -> float:
+    if gap_minutes < AIS_GAP_MIN_MINUTES:
+        return 0.0
+    return float(min(gap_minutes / AIS_GAP_FULL_MINUTES, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Behaviour label (kept for the dashboard's primary-behaviour text)
 # ---------------------------------------------------------------------------
 
 def _derive_behavior(geo: Dict, feat: Dict, anomaly: Dict) -> str:
-    """Return a concise human-readable primary behaviour description."""
-    if geo["inside"]:
-        if feat["loitering_score"] > 0.50:
-            return "Loitering / Zone Violation"
-        return "Zone Violation"
-    if feat["loitering_score"] > 0.60:
+    if geo.get("inside"):
+        return "Loitering / Zone Violation" if feat.get("loitering_score", 0) > 0.50 else "Zone Violation"
+    if feat.get("loitering_score", 0) > 0.60:
         return "Suspicious Loitering"
-    if feat["erratic_score"] > 0.50:
+    if feat.get("erratic_score", 0) > 0.50:
         return "Erratic Movement"
-    if feat["speed_deviation"] > 0.40:
+    if feat.get("speed_deviation", 0) > 0.40:
         return "Speed Anomaly"
-    if geo["near"]:
+    if geo.get("near"):
         return "Proximity to Restricted Zone"
-    if anomaly["is_anomalous"]:
+    if anomaly.get("is_anomalous"):
         return "Anomalous Behaviour"
-    return "Normal Fishing" if feat["speed"] <= 9.0 else "Normal Transit"
+    return "Normal Fishing" if feat.get("speed", 0) <= 9.0 else "Normal Transit"
 
 
 # ---------------------------------------------------------------------------
-# Core scoring
+# Core unified scoring
 # ---------------------------------------------------------------------------
 
 def compute_risk(vessel_id: str,
                  geo: Dict,
                  feat: Dict,
                  anomaly: Dict,
-                 ais_gap_minutes: int = 0,
-                 behavior: Dict = None) -> Dict:
+                 ais_gap_minutes: float = 0,
+                 behavior: Dict = None,
+                 temporal: Dict = None) -> Dict:
     """
-    Compute risk for a single vessel.
+    Compute the unified risk for one vessel.
 
-    Parameters
-    ----------
-    vessel_id : str
-    geo       : result dict from geofencing.check_vessel_zones()
-    feat      : dict of feature values (keyed by feature name)
-    anomaly   : {"anomaly_score": float, "is_anomalous": bool}
-
-    Returns
-    -------
-    {
-      "vessel_id"   : str,
-      "risk_score"  : int 0-100,
-      "risk_level"  : str,
-      "behavior"    : str,
-      "zone_status" : str,
-      "factors"     : list of {factor, contribution, max_weight}
-    }
+    Returns a structured breakdown:
+      vessel_id, risk_score (0-100 int, == overall_score), overall_score,
+      risk_level, behavior, zone_status,
+      geofence_component, isolation_component, temporal_component,
+      behaviour_component, ais_gap_component (each 0-1),
+      factors (weighted breakdown for the panel),
+      risk_factors (plain-language list), explanation,
+      ais_gap_minutes, behavior_summary, behavior_labels.
     """
-    factors: List[Dict] = []
-    raw_total: float = 0.0
-
-    # ── Zone violation ─────────────────────────────────────────────────────
-    if geo["inside"]:
-        contrib = float(W_ZONE_VIOLATION)
-        factors.append({
-            "factor":      f"Restricted Zone Violation ({geo['zone_name']})",
-            "contribution": int(contrib),
-            "max_weight":  W_ZONE_VIOLATION,
-        })
-        raw_total += contrib
-
-    # ── Zone proximity ─────────────────────────────────────────────────────
-    elif geo["near"]:
-        # Scale by how close: 1.0 at threshold boundary → 0.0 at PROXIMITY_MAX
-        prox_frac = feat.get("zone_proximity_norm", 0.0)
-        contrib = W_ZONE_PROXIMITY * prox_frac
-        if contrib > 0.5:
-            factors.append({
-                "factor":      f"Near {geo['nearest_zone']}",
-                "contribution": int(round(contrib)),
-                "max_weight":  W_ZONE_PROXIMITY,
-            })
-            raw_total += contrib
-
-    # ── Loitering ──────────────────────────────────────────────────────────
-    loiter = feat.get("loitering_score", 0.0)
-    if loiter > 0.10:
-        contrib = W_LOITERING * loiter
-        factors.append({
-            "factor":      "Loitering Detected",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_LOITERING,
-        })
-        raw_total += contrib
-
-    # ── Speed anomaly ──────────────────────────────────────────────────────
-    spd_dev = feat.get("speed_deviation", 0.0)
-    if spd_dev > 0.05:
-        contrib = W_SPEED_ANOMALY * spd_dev
-        factors.append({
-            "factor":      "Speed Anomaly",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_SPEED_ANOMALY,
-        })
-        raw_total += contrib
-
-    # ── Erratic movement ───────────────────────────────────────────────────
-    erratic = feat.get("erratic_score", 0.0)
-    if erratic > 0.10:
-        contrib = W_ERRATIC * erratic
-        factors.append({
-            "factor":      "Erratic / Irregular Movement",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_ERRATIC,
-        })
-        raw_total += contrib
-
-    # ── ML anomaly score ───────────────────────────────────────────────────
-    ml_score = anomaly.get("anomaly_score", 0.0)
-    if ml_score > 0.10:
-        contrib = W_ML_ANOMALY * ml_score
-        factors.append({
-            "factor":      "ML Anomaly (Isolation Forest)",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_ML_ANOMALY,
-        })
-        raw_total += contrib
-
-    # ── AIS signal gap ────────────────────────────────────────────────────
-    from data_generator import AIS_GAP_THRESHOLD_MINUTES
-    if ais_gap_minutes >= AIS_GAP_THRESHOLD_MINUTES:
-        # Scale contribution: 20 min → ~50% weight, 60 min → 100%
-        gap_frac = min(ais_gap_minutes / 60.0, 1.0)
-        contrib  = W_AIS_GAP * gap_frac
-        factors.append({
-            "factor":      f"AIS Signal Gap ({ais_gap_minutes} min)",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_AIS_GAP,
-        })
-        raw_total += contrib
-
-    # ── Behavioural signals (M4) — trajectory-derived, explainable ────────
-    # These augment, not replace, the existing signals. A trajectory-derived
-    # AIS gap contributes to the same AIS-gap weight budget if the per-vessel
-    # ais_gap_minutes above was 0 (e.g. historical AIS where gaps come from
-    # timestamps, not the simulated AIS_GAP_MINUTES table). High turning adds a
-    # small erratic-style contribution.
     behavior = behavior or {}
-    traj_gap = float(behavior.get("max_ais_gap_minutes", 0.0))
-    if ais_gap_minutes < 20 and traj_gap >= 20:
-        gap_frac = min(traj_gap / 60.0, 1.0)
-        contrib  = W_AIS_GAP * gap_frac
-        factors.append({
-            "factor":      f"AIS Signal Gap ({int(traj_gap)} min)",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_AIS_GAP,
-        })
-        raw_total += contrib
+    temporal = temporal or {}
+    feat = feat or {}
 
-    mean_turn = float(behavior.get("mean_heading_change", 0.0))
-    if mean_turn >= 45.0:
-        turn_frac = min(mean_turn / 120.0, 1.0)
-        contrib = W_ERRATIC * turn_frac
-        factors.append({
-            "factor":      "Excessive Turning / Course Changes",
-            "contribution": int(round(contrib)),
-            "max_weight":  W_ERRATIC,
-        })
-        raw_total += contrib
+    # ── Components (each in [0,1], each counted once) ─────────────────────
+    c_geo  = _geofence_component(geo, feat)
+    c_iso  = _isolation_component(anomaly)
+    c_temp = _temporal_component(temporal)
+    c_beh  = _behaviour_component(feat, behavior)
+    gap_minutes = _ais_gap_minutes_unified(ais_gap_minutes, behavior)
+    c_gap  = _ais_gap_component(gap_minutes)
 
-    # ── Combo boost: loitering + erratic together is more suspicious ──────
-    if loiter > 0.40 and erratic > 0.50:
-        combo = W_COMBO_BOOST * min((loiter + erratic) / 2.0, 1.0)
-        factors.append({
-            "factor":      "Combined Suspicious Indicators",
-            "contribution": int(round(combo)),
-            "max_weight":  W_COMBO_BOOST,
-        })
-        raw_total += combo
+    # ── Weighted overall score ───────────────────────────────────────────
+    overall = (W_GEOFENCE * c_geo + W_ISOLATION * c_iso + W_TEMPORAL * c_temp
+               + W_BEHAVIOUR * c_beh + W_AIS_GAP * c_gap)
+    overall_score = int(round(min(overall, 1.0) * 100))
 
-    # ── Normalise to 0–100 ────────────────────────────────────────────────
-    risk_score = int(round(min(raw_total / RAW_MAX * 100, 100)))
+    risk_level = ("HIGH" if overall_score >= HIGH_THRESHOLD
+                  else "MEDIUM" if overall_score >= MEDIUM_THRESHOLD
+                  else "LOW")
 
-    # ── Risk level ────────────────────────────────────────────────────────
-    if risk_score >= HIGH_THRESHOLD:
-        risk_level = "HIGH"
-    elif risk_score >= MEDIUM_THRESHOLD:
-        risk_level = "MEDIUM"
-    else:
-        risk_level = "LOW"
+    # ── Weighted factor breakdown (for the dashboard panel) ──────────────
+    factors: List[Dict] = []
 
-    behavior_label = _derive_behavior(geo, feat, anomaly)
-    zone_status = geo["zone_status"]
+    def _add(name: str, comp: float, weight: float):
+        if comp > 0.01:
+            factors.append({
+                "factor":       name,
+                "contribution": int(round(weight * comp * 100)),
+                "max_weight":   int(round(weight * 100)),
+                "component":    round(comp, 4),
+            })
 
-    # ── Explainable risk factors (plain-language, M4) ─────────────────────
-    risk_factors: List[str] = [f["factor"] for f in factors]
+    if geo.get("inside"):
+        _add(f"Inside monitoring zone ({geo.get('zone_name','')})", c_geo, W_GEOFENCE)
+    elif geo.get("near"):
+        _add(f"Near monitoring zone ({geo.get('nearest_zone','')})", c_geo, W_GEOFENCE)
+    _add("Isolation Forest anomaly", c_iso, W_ISOLATION)
+    _add("Temporal sequence anomaly", c_temp, W_TEMPORAL)
+    _add("Behavioural anomaly (loitering/turning/speed)", c_beh, W_BEHAVIOUR)
+    if c_gap > 0.01:
+        _add(f"Significant AIS gap ({int(gap_minutes)} min)", c_gap, W_AIS_GAP)
+
+    # ── Explainable, plain-language risk factors ─────────────────────────
+    risk_factors: List[str] = []
+    if geo.get("inside"):
+        risk_factors.append(f"Inside demonstration monitoring zone ({geo.get('zone_name','')})")
+    elif geo.get("near"):
+        risk_factors.append(f"Operating near monitoring zone ({geo.get('nearest_zone','')})")
+    if c_iso >= 0.55:
+        risk_factors.append("Elevated Isolation Forest anomaly")
+    if c_temp >= 0.55:
+        risk_factors.append("Elevated temporal sequence anomaly")
+    if float(feat.get("loitering_score", 0)) >= 0.6:
+        risk_factors.append("Loitering behaviour")
+    if float(behavior.get("mean_heading_change", 0)) >= 45.0:
+        risk_factors.append("High turning activity")
+    if float(feat.get("speed_deviation", 0)) >= 0.4:
+        risk_factors.append("Speed anomaly")
+    if c_gap > 0.01:
+        risk_factors.append(f"Significant AIS gap ({int(gap_minutes)} min)")
     if not risk_factors:
         risk_factors = ["No elevated risk indicators"]
 
+    behavior_label = _derive_behavior(geo, feat, anomaly)
+
+    if risk_level == "HIGH":
+        explanation = ("Multiple or strong suspicious fishing-related behaviour "
+                       "indicators detected.")
+    elif risk_level == "MEDIUM":
+        explanation = "Some suspicious behaviour indicators present; monitor."
+    else:
+        explanation = "No significant suspicious behaviour indicators."
+
     return {
-        "vessel_id":        vessel_id,
-        "risk_score":       risk_score,
-        "risk_level":       risk_level,
-        "behavior":         behavior_label,
-        "zone_status":      zone_status,
-        "factors":          factors,
-        "risk_factors":     risk_factors,
-        "ais_gap_minutes":  ais_gap_minutes,
-        "behavior_summary": behavior.get("behavior_summary", ""),
-        "behavior_labels":  behavior.get("behavior_labels", []),
+        "vessel_id":           vessel_id,
+        "risk_score":          overall_score,     # back-compat alias
+        "overall_score":       overall_score,
+        "risk_level":          risk_level,
+        "behavior":            behavior_label,
+        "zone_status":         geo.get("zone_status", "Open Waters"),
+        "geofence_component":  round(c_geo, 4),
+        "isolation_component": round(c_iso, 4),
+        "temporal_component":  round(c_temp, 4),
+        "behaviour_component": round(c_beh, 4),
+        "ais_gap_component":   round(c_gap, 4),
+        "factors":             factors,
+        "risk_factors":        risk_factors,
+        "explanation":         explanation,
+        "ais_gap_minutes":     int(round(gap_minutes)),
+        "behavior_summary":    behavior.get("behavior_summary", ""),
+        "behavior_labels":     behavior.get("behavior_labels", []),
     }
 
 
@@ -262,18 +244,19 @@ def run_risk_engine(vessel_ids: List[str],
                     geo_map: Dict[str, Dict],
                     feature_df,
                     anomaly_map: Dict[str, Dict],
-                    behavior_map: Dict[str, Dict] = None) -> Dict[str, Dict]:
+                    behavior_map: Dict[str, Dict] = None,
+                    temporal_map: Dict[str, Dict] = None) -> Dict[str, Dict]:
     """
-    Run the risk engine for all vessels.
+    Run the unified risk engine for all vessels.
 
-    behavior_map : optional {vessel_id: behaviour_dict} from behavior_analysis
-                   (M4). When None, behaviour contributions are simply absent
-                   and the engine behaves as before.
+    behavior_map : optional {vessel_id: behaviour_dict} (M4)
+    temporal_map : optional {vessel_id: {temporal_anomaly_score, ...}} (M6)
 
-    Returns {vessel_id: risk_result_dict}
+    Returns {vessel_id: unified_risk_result}
     """
     from data_generator import get_ais_gap
     behavior_map = behavior_map or {}
+    temporal_map = temporal_map or {}
     results: Dict[str, Dict] = {}
     for vid in vessel_ids:
         geo     = geo_map.get(vid, {"inside": False, "near": False,
@@ -285,80 +268,65 @@ def run_risk_engine(vessel_ids: List[str],
         gap     = get_ais_gap(vid)
         results[vid] = compute_risk(vid, geo, feat, anomaly,
                                     ais_gap_minutes=gap,
-                                    behavior=behavior_map.get(vid))
+                                    behavior=behavior_map.get(vid),
+                                    temporal=temporal_map.get(vid))
     return results
 
 
 # ---------------------------------------------------------------------------
-# Alert generation
+# Alert generation (unchanged interface; honest wording)
 # ---------------------------------------------------------------------------
 
 def generate_alerts(risk_results: Dict[str, Dict]) -> List[Dict]:
     """
-    Dynamically generate alerts from computed risk results.
+    Dynamically generate alerts from unified risk results.
 
-    Returns a list of alert dicts sorted by severity then risk_score desc.
+    Returns alert dicts sorted HIGH-first then by descending score.
     Each alert: {level, icon, vessel, message, reason}
     """
     alerts: List[Dict] = []
     level_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
     for vid, result in risk_results.items():
-        level      = result["risk_level"]
-        score      = result["risk_score"]
-        behavior   = result["behavior"]
-        zone_stat  = result["zone_status"]
-        factors    = result["factors"]
+        level     = result["risk_level"]
+        score     = result["overall_score"]
+        behavior  = result["behavior"]
+        zone_stat = result["zone_status"]
+        factors   = result["factors"]
 
         if level not in ("HIGH", "MEDIUM"):
             continue
 
         icon = "🔴" if level == "HIGH" else "🟠"
-
-        # Build a concise message from top factor
-        if factors:
-            top_factor = max(factors, key=lambda f: f["contribution"])
-            reason     = top_factor["factor"]
-        else:
-            reason = behavior
+        reason = (max(factors, key=lambda f: f["contribution"])["factor"]
+                  if factors else behavior)
 
         if "Zone Violation" in behavior or "INSIDE" in zone_stat:
-            message = (f"{vid} detected inside restricted zone "
-                       f"— {zone_stat}. Immediate investigation required.")
+            message = (f"{vid} detected inside monitoring zone — {zone_stat}. "
+                       f"Suspicious fishing-related behaviour indicators detected.")
         elif "Loitering" in behavior:
-            message = (f"{vid} showing sustained loitering behaviour "
-                       f"(score: {score}/100). Suspicious fishing-related "
-                       f"behaviour indicators detected.")
+            message = (f"{vid} sustained loitering behaviour (risk {score}/100). "
+                       f"Suspicious fishing-related behaviour indicators detected.")
         elif "AIS Gap" in reason or result.get("ais_gap_minutes", 0) >= 20:
             gap = result.get("ais_gap_minutes", 0)
-            message = (f"{vid} AIS signal gap of {gap} minutes recorded "
+            message = (f"{vid} AIS signal gap of {gap} minutes "
                        f"— suspicious reporting-gap behaviour indicator.")
+        elif "Temporal" in reason:
+            message = (f"{vid} elevated temporal sequence anomaly (risk {score}/100).")
         elif "Speed Anomaly" in behavior:
-            message = (f"{vid} speed anomaly detected "
-                       f"— movement pattern inconsistent with normal fishing.")
+            message = (f"{vid} speed anomaly — movement inconsistent with normal fishing.")
         elif "Erratic" in behavior:
-            message = (f"{vid} erratic course changes detected "
-                       f"— behaviour inconsistent with legitimate transit.")
+            message = (f"{vid} erratic course changes — behaviour inconsistent with transit.")
         elif "Proximity" in behavior or "Near" in zone_stat:
-            message = (f"{vid} operating close to restricted zone "
-                       f"({zone_stat}) — monitor closely.")
+            message = (f"{vid} operating close to monitoring zone ({zone_stat}) — monitor.")
         elif "Anomalous" in behavior:
-            message = (f"{vid} flagged by anomaly detection model "
-                       f"(score: {score}/100). Pattern deviates from fleet norms.")
+            message = (f"{vid} flagged by anomaly detection (risk {score}/100).")
         else:
-            message = f"{vid} risk score {score}/100 — {reason}."
+            message = f"{vid} risk {score}/100 — {reason}."
 
-        alerts.append({
-            "level":   level,
-            "icon":    icon,
-            "vessel":  vid,
-            "message": message,
-            "reason":  reason,
-        })
+        alerts.append({"level": level, "icon": icon, "vessel": vid,
+                       "message": message, "reason": reason})
 
-    # Sort: HIGH first, then by descending risk_score
-    alerts.sort(key=lambda a: (
-        level_order.get(a["level"], 9),
-        -risk_results[a["vessel"]]["risk_score"],
-    ))
+    alerts.sort(key=lambda a: (level_order.get(a["level"], 9),
+                               -risk_results[a["vessel"]]["overall_score"]))
     return alerts
