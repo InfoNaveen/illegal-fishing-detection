@@ -43,6 +43,9 @@ from ais_loader import (
 # ── Round 3 M2: AIS cleaning + regional zone configuration ──────────────────
 from data_processing import clean_ais_dataframe
 from zones import get_zones, get_region_meta
+# ── Round 3 M3: SQLite persistence (history sink — never a hard dependency) ──
+import database
+from database import DatabaseError, DEFAULT_DB_PATH
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -197,6 +200,7 @@ def run_pipeline(source: str = "Simulated",
     # itself is unchanged.
     zones = get_zones(source)
     quality_report: dict = {}
+    positions_df = None   # cleaned positions to persist (Historical AIS only)
 
     # 1 + 2. Raw vessel data + trajectories (source-dependent).
     if source == "Historical AIS":
@@ -205,6 +209,12 @@ def run_pipeline(source: str = "Simulated",
         clean_df, quality_report = clean_ais_dataframe(ais_df)
         trajectories = build_trajectories_from_ais(clean_df) # full multi-point tracks (cleaned)
         base_df      = summarize_latest_positions(clean_df)  # one current row per vessel
+        # Keep the cleaned positions for persistence (M3). Convert timestamp to
+        # string here so the sink layer stores a stable value.
+        positions_df = clean_df[["vessel_id", "timestamp",
+                                 "latitude", "longitude",
+                                 "speed", "heading"]].copy()
+        positions_df["timestamp"] = positions_df["timestamp"].astype(str)
     else:
         # Default simulated path — unchanged from Round 2.
         base_df      = generate_vessel_dataframe()
@@ -243,6 +253,7 @@ def run_pipeline(source: str = "Simulated",
         "map_zoom":       region_meta["map_zoom"],
         "zone_label":     region_meta["zone_label"],
         "quality_report": quality_report,
+        "positions_df":   positions_df,
     }
 
     return df, alerts, anomaly_map, risk_map, feature_df, meta
@@ -272,6 +283,47 @@ except (AISFileError, AISColumnError) as exc:
         source="Simulated",
         csv_path=DEFAULT_AIS_CSV_PATH,
     )
+
+
+# ---------------------------------------------------------------------------
+# M3 persistence boundary — focused try/except. SQLite is a history SINK:
+# if it fails, the pipeline results above are untouched and the dashboard
+# still renders. The write is cached per source so repeated Streamlit reruns
+# do not re-insert on every widget interaction.
+# ---------------------------------------------------------------------------
+_persist_warning = ""
+
+
+@st.cache_data(show_spinner=False)
+def _persist_once(source: str, _df, _feat, _anom, _risk, _alerts, region, _positions):
+    """Persist one pipeline run. Cached per source so it writes once per run.
+    Returns the row-count dict. Underscored args are excluded from the cache
+    key by Streamlit; `source` is the cache key."""
+    database.initialize_database(DEFAULT_DB_PATH)
+    return database.persist_pipeline_run(
+        enriched_df=_df,
+        feature_df=_feat,
+        anomaly_map=_anom,
+        risk_map=_risk,
+        alerts=_alerts,
+        source=source,
+        region=region,
+        positions_df=_positions,
+        db_path=DEFAULT_DB_PATH,
+    )
+
+
+try:
+    _persist_counts = _persist_once(
+        _active_source, df, feature_df, anomaly_map, risk_map, alerts,
+        pipeline_meta["region"], pipeline_meta.get("positions_df"),
+    )
+except DatabaseError as exc:
+    _persist_warning = f"Persistence unavailable (results still shown): {exc}"
+    _persist_counts = {}
+except Exception as exc:  # defensive: persistence must never kill the app
+    _persist_warning = f"Persistence skipped (results still shown): {exc}"
+    _persist_counts = {}
 
 
 # ---------------------------------------------------------------------------
@@ -511,11 +563,32 @@ with st.sidebar:
                   <span class="info-value">{val:.4f}</span>
                 </div>""", unsafe_allow_html=True)
 
+        # ── Recent history for this vessel (from SQLite, M3) ─────────────
+        try:
+            _vh = database.get_vessel_recent(selected_vessel, limit=5,
+                                             db_path=DEFAULT_DB_PATH)
+        except Exception:
+            _vh = {"risk": [], "alerts": []}
+        if _vh.get("risk"):
+            st.markdown('<div class="section-header" style="margin-top:14px;">🕑 Recent History</div>',
+                        unsafe_allow_html=True)
+            for r in _vh["risk"]:
+                rl = r.get("risk_level", "")
+                rc = {"HIGH": "#FF3333", "MEDIUM": "#FF8C00", "LOW": "#2ECC71"}.get(rl, "#8899bb")
+                ts = str(r.get("computed_at", ""))[:16].replace("T", " ")
+                st.markdown(f"""
+                <div class="info-row">
+                  <span class="info-label" style="font-size:0.7rem;">{ts}</span>
+                  <span class="info-value" style="color:{rc};">
+                    {int(r.get('risk_score', 0))}/100 · {rl}
+                  </span>
+                </div>""", unsafe_allow_html=True)
+
     st.markdown('<hr style="border-color:#1e2d50;margin:20px 0 12px;">', unsafe_allow_html=True)
-    st.markdown("""
+    st.markdown(f"""
     <div style="font-size:0.68rem;color:#2a4060;text-align:center;line-height:1.6;">
       Live Detection Pipeline · Isolation Forest<br>
-      Bay of Bengal · Maritime Surveillance
+      {pipeline_meta.get('region', 'Bay of Bengal')} · Maritime Surveillance
     </div>
     """, unsafe_allow_html=True)
 
@@ -727,13 +800,80 @@ with bottom_right:
     ml_df = pd.DataFrame(ml_rows)
     st.dataframe(ml_df, hide_index=True, height=200, width="stretch")
 
+st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
+
+# ── History section (M3 — SQLite-backed) ─────────────────────────────────────
+st.markdown('<div class="section-header">🗄️ Stored History (SQLite)</div>',
+            unsafe_allow_html=True)
+
+if _persist_warning:
+    st.warning(_persist_warning)
+
+try:
+    _hist = database.get_history_summary(DEFAULT_DB_PATH)
+    _recent_alerts = database.get_recent_alerts(limit=8, db_path=DEFAULT_DB_PATH)
+    _recent_risk = database.get_recent_risk(limit=8, db_path=DEFAULT_DB_PATH)
+    _history_ok = True
+except Exception as exc:
+    _history_ok = False
+    st.info(f"History is temporarily unavailable: {exc}")
+
+if _history_ok:
+    hc1, hc2, hc3, hc4 = st.columns(4)
+    with hc1:
+        st.metric("🚢 Vessels Stored", f"{_hist['total_vessels']:,}")
+    with hc2:
+        st.metric("📍 Positions Stored", f"{_hist['total_positions']:,}")
+    with hc3:
+        st.metric("🚨 Alerts Stored", f"{_hist['total_alerts']:,}")
+    with hc4:
+        st.metric("🔴 HIGH Alerts", f"{_hist['high_alerts']:,}")
+
+    hleft, hright = st.columns(2, gap="medium")
+
+    with hleft:
+        st.markdown('<div class="section-header" style="margin-top:8px;">Recent Alerts</div>',
+                    unsafe_allow_html=True)
+        if _recent_alerts:
+            _ra_df = pd.DataFrame([
+                {
+                    "Vessel": a["vessel_id"],
+                    "Level":  a["level"],
+                    "Message": (a["message"] or "")[:60],
+                    "Time":   str(a["created_at"])[:16].replace("T", " "),
+                }
+                for a in _recent_alerts
+            ])
+            st.dataframe(_ra_df, hide_index=True, height=240, width="stretch")
+        else:
+            st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No alerts stored yet.</p>',
+                        unsafe_allow_html=True)
+
+    with hright:
+        st.markdown('<div class="section-header" style="margin-top:8px;">Recent Risk Assessments</div>',
+                    unsafe_allow_html=True)
+        if _recent_risk:
+            _rr_df = pd.DataFrame([
+                {
+                    "Vessel": r["vessel_id"],
+                    "Score":  int(r["risk_score"]) if r["risk_score"] is not None else 0,
+                    "Level":  r["risk_level"],
+                    "Time":   str(r["computed_at"])[:16].replace("T", " "),
+                }
+                for r in _recent_risk
+            ])
+            st.dataframe(_rr_df, hide_index=True, height=240, width="stretch")
+        else:
+            st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No risk records stored yet.</p>',
+                        unsafe_allow_html=True)
+
 st.markdown("<div style='margin-bottom:24px;'></div>", unsafe_allow_html=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div style="text-align:center;padding:16px;border-top:1px solid #1e2d50;
             color:#2a4060;font-size:0.7rem;letter-spacing:0.06em;">
   ILLEGAL FISHING DETECTION SYSTEM · ISOLATION FOREST ANOMALY DETECTION
-  &nbsp;|&nbsp; Bay of Bengal Maritime Surveillance
+  &nbsp;|&nbsp; {pipeline_meta.get('region', 'Bay of Bengal')} Maritime Surveillance
 </div>
 """, unsafe_allow_html=True)

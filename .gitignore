@@ -46,3 +46,9 @@ desktop.ini
 *.parquet
 *.h5
 *.pkl
+
+# SQLite runtime database (local application history — not committed)
+data/ifds.db
+*.db
+*.sqlite
+*.sqlite3

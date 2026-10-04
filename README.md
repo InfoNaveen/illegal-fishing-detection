@@ -247,6 +247,37 @@ geofencing algorithm itself is unchanged and shared by both modes:
 
 ---
 
+## Persistence (local history)
+
+Each completed pipeline run is persisted to a **local SQLite database** (`database.py`,
+Python standard-library `sqlite3` — no external database dependency). The database is a
+**history / sink layer only**: the in-memory detection pipeline runs independently of it,
+and if persistence fails the pipeline results and dashboard still render (a warning is
+shown). It is a local application history, not cloud storage.
+
+**Database location:** `data/ifds.db` (created on first run; git-ignored — not committed).
+
+**Stored entities:**
+
+| Table | Contents |
+|---|---|
+| `vessels` | one row per vessel (UPSERT — no duplicates), with source and region |
+| `positions` | cleaned AIS positions; `UNIQUE(vessel_id, timestamp, latitude, longitude, source)` with `INSERT OR IGNORE` so repeated runs do not duplicate |
+| `features` | per-vessel engineered feature values, stored as JSON, stamped with a run timestamp |
+| `anomaly_scores` | Isolation Forest score + anomalous flag per vessel per run |
+| `risk_scores` | risk score, level, zone status, behaviour, AIS gap, per vessel per run |
+| `alerts` | generated alerts (vessel, level, message, reason, timestamp) |
+
+Writes use a single connection, one transaction, and `executemany()` for speed. In
+Historical AIS mode the **cleaned** positions are stored (not the raw rows and not the
+original large CSV). The dashboard shows a **Stored History** panel (counts, recent alerts,
+recent risk assessments) and the vessel inspector shows a per-vessel recent-history list.
+
+> This persists an unsupervised anomaly/suspicious-behaviour history. It does not record a
+> determination that any vessel was fishing illegally.
+
+---
+
 ## Technology Stack
 
 | Library | Purpose |
@@ -279,10 +310,14 @@ illegal-fishing-detection/
 ├── anomaly_detector.py     # Isolation Forest model training and scoring
 ├── risk_engine.py          # Weighted risk scoring, classification, alert generation
 │
+├── database.py             # SQLite persistence layer (local history sink)
+│
 ├── test_ais_loader.py      # Focused tests for the AIS ingestion layer
 ├── test_data_processing.py # Tests for AIS cleaning + zone configuration
+├── test_database.py        # Tests for SQLite persistence (temp DB)
 ├── data/
 │   ├── ifds_ais_sample.csv # Historical AIS sample — Danish waters, 2025-02-27 (~100k rows)
+│   ├── ifds.db             # SQLite runtime history (git-ignored, created on first run)
 │   ├── sample_ais.csv      # Tiny synthetic TEST FIXTURE (not real AIS data)
 │   └── README.md           # Notes on the data directory and real AIS usage
 │
