@@ -1232,13 +1232,51 @@ if _history_ok:
             st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No risk records stored yet.</p>',
                         unsafe_allow_html=True)
 
-st.markdown("<div style='margin-bottom:24px;'></div>", unsafe_allow_html=True)
+st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
+
+# ── System Information (M9) — compact subsystem status ───────────────────────
+st.markdown('<div class="section-header">🛠️ System Information</div>',
+            unsafe_allow_html=True)
+
+def _sys_badge(ok: bool, label: str) -> str:
+    colour = "#2ECC71" if ok else "#FF8C00"
+    dot = "●"
+    return (f'<div style="font-size:0.72rem;color:{colour};">{dot} {label}</div>')
+
+_db_ok = not _persist_warning
+_if_ok = pipeline_meta.get("model_status") in ("loaded", "trained", "retrained")
+_tm_ok = pipeline_meta.get("temporal_status") in ("loaded", "trained", "retrained")
+
+si1, si2, si3 = st.columns(3)
+with si1:
+    st.markdown(_sys_badge(True, f"Data source: {_active_source}"), unsafe_allow_html=True)
+    st.markdown(_sys_badge(_db_ok, "SQLite persistence"), unsafe_allow_html=True)
+with si2:
+    st.markdown(_sys_badge(_if_ok, f"Isolation Forest ({pipeline_meta.get('model_status','ready')})"),
+                unsafe_allow_html=True)
+    st.markdown(_sys_badge(_tm_ok, f"Temporal model ({pipeline_meta.get('temporal_status','ready')})"),
+                unsafe_allow_html=True)
+with si3:
+    st.markdown(_sys_badge(True, "Unified risk engine (M7)"), unsafe_allow_html=True)
+    st.markdown(_sys_badge(True, "Geofencing: " + pipeline_meta.get("region", "")),
+                unsafe_allow_html=True)
+
+st.markdown(
+    '<div style="font-size:0.66rem;color:#5a7aa5;margin-top:8px;line-height:1.5;">'
+    'Unsupervised anomaly / suspicious-behaviour detection. Historical AIS data '
+    '(Danish waters) is used for validation; monitoring zones are demonstration '
+    'zones. The system identifies suspicious behaviour indicators and does not '
+    'prove illegal fishing. No live AIS feed is connected.</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="text-align:center;padding:16px;border-top:1px solid #1e2d50;
             color:#2a4060;font-size:0.7rem;letter-spacing:0.06em;">
-  ILLEGAL FISHING DETECTION SYSTEM · ISOLATION FOREST ANOMALY DETECTION
+  ILLEGAL FISHING DETECTION SYSTEM · ISOLATION FOREST + TEMPORAL ANOMALY DETECTION
   &nbsp;|&nbsp; {pipeline_meta.get('region', 'Bay of Bengal')} Maritime Surveillance
 </div>
 """, unsafe_allow_html=True)

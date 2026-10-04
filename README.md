@@ -1,367 +1,303 @@
-# Illegal Fishing Detection System
+# Illegal Fishing Detection System (IFDS)
 
-An AI-assisted maritime vessel monitoring and suspicious-behaviour detection prototype.
-The system monitors simulated vessel movement across a defined maritime region, identifies
-anomalous behaviour patterns, detects restricted-zone violations, calculates dynamic
-per-vessel risk scores, and generates prioritised alerts — all within an interactive
-Streamlit dashboard.
+An AI-assisted maritime vessel-monitoring and suspicious-behaviour detection
+**demonstrator**. IFDS ingests vessel movement data, cleans and validates it,
+derives behavioural indicators from vessel trajectories, applies two
+unsupervised anomaly detectors (Isolation Forest + a temporal sequence
+autoencoder), computes a unified explainable risk score with configurable
+geographic monitoring zones, generates prioritised alerts, persists results to a
+local database, and presents everything in an interactive Streamlit dashboard —
+including a controlled real-time **replay** of historical AIS data.
 
-> **Note:** The system runs in two modes. **Simulated** (default) uses a built-in
-> synthetic vessel fleet. **Historical AIS** ingests vessel-movement data from a local
-> CSV file via the AIS loader. The project does **not** provide a live AIS feed, real-time
-> satellite data, or production maritime surveillance — ingestion is from historical/local
-> data only.
-
----
-
-## Key Features
-
-- Interactive dark-themed maritime map (Folium + CartoDB tiles)
-- Real-time vessel fleet overview with risk-coloured markers
-- Restricted-zone geofencing using ray-casting point-in-polygon geometry
-- Behavioural feature extraction from simulated vessel trajectories
-- Speed anomaly detection
-- Loitering detection based on displacement ratio and speed
-- Trajectory and heading variance analysis
-- Zone proximity scoring
-- AIS signal gap detection
-- Isolation Forest unsupervised anomaly detection
-- Dynamic risk scoring (0–100) with weighted factor contributions
-- Risk classification: LOW / MEDIUM / HIGH
-- Dynamic alert generation sorted by severity
-- Per-vessel anomaly score and risk factor breakdown in the sidebar inspector
+> **Honest scope.** This is a prototype / final-year-project demonstrator. It
+> identifies **anomalous and suspicious movement behaviour**. It does **not**
+> prove illegal fishing, is **not** connected to a live AIS feed, and makes **no**
+> accuracy/precision/recall claims because there is no labelled illegal-fishing
+> ground truth. See the Disclaimer at the end.
 
 ---
 
-## System Architecture
+## Problem statement
 
-```mermaid
-flowchart TD
-    A[Vessel Movement Data] --> B[Trajectory Processing]
-    B --> C[Feature Engineering]
-    B --> D[Geofencing]
-    C --> E[Behaviour Analysis]
-    D --> E
-    E --> F[Isolation Forest]
-    F --> G[Risk Engine]
-    G --> H[Risk Classification]
-    H --> I[Alert Generation]
-    I --> J[Streamlit Dashboard]
+Illegal, unreported and unregulated (IUU) fishing is hard to monitor at scale.
+Vessels broadcast AIS position reports, and suspicious patterns — loitering,
+entering restricted areas, abnormal turning, going dark (AIS gaps), or moving
+unlike the rest of the fleet — can indicate activity worth investigating. IFDS
+demonstrates an end-to-end pipeline that surfaces these behavioural **risk
+signals** in an explainable way, so an analyst can decide what to investigate.
+It does not make enforcement decisions and does not label vessels as criminal.
+
+---
+
+## Key features
+
+- Historical AIS CSV ingestion with flexible column normalisation
+- Deterministic data cleaning + validation (no fabricated values)
+- Source-aware, configurable geographic monitoring zones (ray-casting geofencing)
+- Behavioural trajectory analysis (distance, speed stats, turning, loitering,
+  stationarity, AIS gaps, duration)
+- Isolation Forest point-anomaly detection with a persistent train-once model
+- Temporal sequence anomaly detection (PCA sequence autoencoder, persistent)
+- Unified, explainable risk engine combining five normalised signals
+- Dynamic alerts with human-readable reasons
+- Local SQLite persistence (history sink)
+- Interactive dark maritime dashboard (map, metrics, inspector, history)
+- Controlled **AIS replay simulation** mode with live metrics and dedup alerts
+- Three data modes: Simulated · Historical AIS · Real-Time (Replay) Simulation
+
+---
+
+## Architecture
+
+```text
+                 Data source (Simulated | Historical AIS | Replay)
+                                   |
+                           AIS ingestion (ais_loader)
+                                   |
+                     Data cleaning + validation (data_processing)
+                                   |
+              ┌────────────────────┴────────────────────┐
+              |                                          |
+       Geofencing (zones)                     Trajectory / behaviour
+       (geofencing)                           analysis (behavior_analysis)
+              |                                          |
+              └────────────────────┬────────────────────┘
+                                   |
+                     Feature engineering (21 numeric features)
+                                   |
+              ┌────────────────────┴────────────────────┐
+              |                                          |
+     Isolation Forest                           Temporal sequence
+     (anomaly_detector +                        autoencoder (temporal_model +
+      model_manager, persistent)                temporal_model_manager, persistent)
+              |                                          |
+              └────────────────────┬────────────────────┘
+                                   |
+                     Unified risk engine (risk_engine)
+                                   |
+                        Alert generation (risk_engine /
+                        alert_engine for replay)
+                                   |
+                        SQLite persistence (database)
+                                   |
+                        Streamlit dashboard (app.py)
 ```
 
 ---
 
-## How It Works
+## Data sources
 
-### 1. Vessel Data Generation (`data_generator.py`)
+IFDS runs in three modes, selected in the sidebar (default: **Simulated**).
 
-A fleet of 18 simulated vessels is defined with base positions, speeds, headings, and
-behaviour types. Trajectories are generated programmatically — the shape of each
-trajectory (loitering circle, erratic random walk, straight transit, drift) is
-determined by the vessel's assigned behaviour profile. A fixed random seed ensures
-results are reproducible.
+### Simulated — Bay of Bengal demonstration
 
-### 2. Geofencing (`geofencing.py`)
+A built-in synthetic fleet of 18 vessels with hand-placed scenarios (e.g. V102,
+V087, V215 inside restricted zones). Fully reproducible; used for demonstration
+and regression testing. Zones here are **demonstration restricted zones**.
 
-Each vessel's current coordinates are checked against three restricted fishing-zone
-polygons using the **ray-casting (Jordan curve) algorithm** — no external geometry
-library is required. The module also computes minimum distance from each vessel to the
-nearest zone boundary, producing a proximity score used downstream by the risk engine.
+### Historical AIS — Danish waters
 
-### 3. Feature Engineering (`feature_engineering.py`)
+Ingests a local historical AIS CSV (`data/ifds_ais_sample.csv`) sourced from
+Danish Maritime Authority open AIS data (2025-02-27): ~100,000 raw records
+across ~2,107 vessels. This is **historical movement data**, not a live feed.
+Monitoring zones here are **demonstration monitoring zones** placed over
+observed dense-traffic regions — **not** authoritative legal restricted areas.
 
-Nine numerical behavioural features are extracted per vessel from its trajectory:
+### Real-Time (Replay) Simulation
 
-| Feature | Description |
-|---|---|
-| `speed` | Current reported speed (knots) |
-| `speed_deviation` | Deviation from normal fishing speed range |
-| `heading_variance` | Variance of course changes along the trajectory |
-| `displacement_ratio` | Net displacement ÷ total path length (0 = loitering, 1 = straight) |
-| `loitering_score` | Combined loitering indicator (displacement + speed) |
-| `path_length_deg` | Total arc-length of trajectory |
-| `bearing_change_rate` | Mean absolute bearing change per step |
-| `zone_proximity_norm` | Normalised proximity to nearest restricted zone |
-| `erratic_score` | Std-dev of step lengths normalised by mean |
+A controlled, deterministic **replay** of the cleaned historical AIS data,
+emitted tick-by-tick with live metrics and alerts. **It is not a live AIS feed**
+and does not receive vessels in real time.
 
-### 4. Anomaly Detection (`anomaly_detector.py`)
-
-An **Isolation Forest** model (scikit-learn, 200 estimators, contamination=0.20,
-random\_state=42) is fitted on the 18-vessel feature matrix. The model's raw
-`decision_function` output is inverted and normalised to a `[0, 1]` anomaly score where
-**1.0 = most anomalous**. Vessels scoring above 0.55 are flagged as anomalous.
-
-The model is trained on every pipeline run. No pre-trained model file is persisted in
-this prototype.
-
-### 5. Risk Engine (`risk_engine.py`)
-
-A transparent weighted scoring function combines multiple signals into a 0–100 risk
-score:
-
-| Signal | Max contribution |
-|---|---|
-| Restricted zone violation | 40 pts |
-| ML anomaly score (Isolation Forest) | 25 pts |
-| Loitering | 20 pts |
-| Zone proximity | 15 pts |
-| Speed anomaly | 12 pts |
-| Erratic movement | 10 pts |
-| AIS signal gap | 10 pts |
-| Combined suspicious indicators boost | 8 pts |
-
-Risk classification thresholds: **HIGH ≥ 55**, **MEDIUM ≥ 20**, **LOW < 20**.
-
-> These weights and thresholds are prototype values. Domain calibration against real
-> maritime enforcement data would be required before operational use.
-
-### 6. Alert Generation (`risk_engine.py → generate_alerts()`)
-
-Alerts are generated dynamically from the computed risk results — there are no
-hard-coded alert messages. Each alert includes vessel ID, severity level, and a
-human-readable message describing the primary risk factor. Alerts are sorted HIGH first,
-then by descending risk score.
-
-### 7. Dashboard (`app.py`)
-
-The Streamlit dashboard is built on the enriched vessel DataFrame produced by the
-pipeline. It provides:
-
-- **Metrics row**: total vessels, HIGH/MEDIUM/LOW counts, active alert count
-- **Interactive map**: dark-tiled Folium map with restricted zone polygons, vessel
-  movement trails, and risk-coloured CircleMarkers with popup detail cards
-- **Alerts panel**: dynamically generated alerts displayed as severity-coded cards
-- **Fleet status table**: all vessels ranked by risk score
-- **Vessel inspector** (sidebar): select any vessel ID to view speed, heading,
-  coordinates, risk score, zone status, Isolation Forest anomaly score, AIS gap
-  warning, computed risk factor breakdown, and raw feature values
-- **Detection pipeline diagram**: six-stage visual overview
-- **High-risk analysis panel**: factor breakdown cards for HIGH-risk vessels
-- **Isolation Forest scores table**: full fleet anomaly scores ranked by score
+> The project does not provide live AIS, real-time satellite data, or production
+> maritime surveillance. Ingestion is from historical/local data only.
 
 ---
 
-## Data Sources
+## Data pipeline
 
-The dashboard sidebar provides a **Data Source** selector with two modes.
+### AIS ingestion (`ais_loader.py`)
 
-### Simulated (default)
+Loads a local CSV and normalises common AIS column aliases to a fixed internal
+schema. Recognised aliases:
 
-Uses the built-in synthetic vessel fleet from `data_generator.py`
-(`generate_vessel_dataframe()` + `build_all_trajectories()`). This is the original,
-fully reproducible demonstration fleet and remains the default. Nothing about this mode
-has changed.
-
-### Historical AIS
-
-Ingests vessel-movement data from a **local historical AIS CSV** via `ais_loader.py`,
-then feeds the normalised result through the exact same downstream pipeline (geofencing →
-feature engineering → Isolation Forest → risk engine → alerts). No separate pipeline, no
-duplicated risk engine or anomaly detector.
-
-AIS (Automatic Identification System) data describes vessel **movement only**. It does not
-by itself prove illegal fishing. Suspicious-behaviour detection is performed entirely by
-the downstream analysis pipeline. The loader therefore does **not** assign any
-fishing/illegal behaviour label to raw AIS records.
-
-> This is **historical AIS data ingestion** from a local CSV — not a live AIS feed, not a
-> commercial API, and not real-time satellite data. No API key or network access is
-> required.
-
-#### Expected CSV schema
-
-The loader normalises common AIS column-name variants to a fixed internal schema. Provide
-at least a vessel identifier, latitude, and longitude; speed, heading, and timestamp are
-used when present.
-
-| Internal field | Recognised source column aliases (case-insensitive) | Required |
+| Internal field | Aliases | Required |
 |---|---|---|
-| `vessel_id` | `MMSI`, `vessel_id`, `id`, `ship_id` | **Yes** |
-| `latitude`  | `LAT`, `latitude`, `y` | **Yes** |
-| `longitude` | `LON`, `long`, `lng`, `longitude`, `x` | **Yes** |
-| `speed`     | `SOG`, `speed`, `speed_over_ground` | No (defaults to 0.0) |
-| `heading`   | `COG`, `heading`, `course`, `course_over_ground` | No (defaults to 0.0) |
-| `timestamp` | `BaseDateTime`, `timestamp`, `time`, `datetime` | No (row order used if absent) |
+| `vessel_id` | MMSI, vessel_id, id, ship_id | Yes |
+| `latitude`  | LAT, latitude, y | Yes |
+| `longitude` | LON, long, lng, longitude, x | Yes |
+| `speed`     | SOG, speed, speed_over_ground | No |
+| `heading`   | COG, heading, course, course_over_ground | No |
+| `timestamp` | BaseDateTime, timestamp, time, datetime | No |
 
-If a **required** column cannot be resolved, the loader raises a clear error naming the
-missing field. Rows with invalid coordinates (latitude outside ±90, longitude outside
-±180, or non-numeric) are dropped — never fabricated.
+Missing required columns raise a clear error; invalid coordinates are dropped
+(never fabricated).
 
-The bundled historical sample uses `DD/MM/YYYY HH:MM:SS` timestamps, which the cleaning
-stage parses explicitly (day-first) to avoid ambiguity.
+### Data cleaning (`data_processing.py`)
 
-#### Configuring the AIS CSV
+Deterministic cleaning between ingestion and the pipeline: day-first timestamp
+parsing (`DD/MM/YYYY HH:MM:SS`), numeric coercion, coordinate validation,
+negative-speed removal, heading normalisation (0 valid, 511 sentinel → NaN), and
+**exact-duplicate removal** (`vessel_id, timestamp, latitude, longitude`). On
+the bundled Danish sample, cleaning reduces 100,000 rows → ~53,597 by removing
+exact-duplicate broadcasts while preserving every vessel. It never interpolates
+or invents positions, and returns a deterministic data-quality report.
 
-Historical AIS mode reads, by default, the repository-relative path:
+### Monitoring zones (`zones.py`)
 
-```
-data/ifds_ais_sample.csv
-```
-
-`data/ifds_ais_sample.csv` is a **historical AIS sample from Danish waters** (Danish
-Maritime Authority AIS data, 2025-02-27): ~100,000 records across ~2,107 vessels. It is
-historical movement data, not a live feed. A separate tiny synthetic fixture,
-`data/sample_ais.csv` (vessel IDs `TEST001`…), is retained **only** for the automated test
-suite and is never presented as real AIS data.
-
-If the configured file is missing or invalid, the dashboard shows a clear message and
-automatically falls back to Simulated mode — it never crashes.
-
-#### Data cleaning (preprocessing)
-
-Historical AIS records pass through a deterministic cleaning stage (`data_processing.py`)
-before the detection pipeline:
-
-```
-historical CSV → ais_loader → data_processing → trajectories → detection pipeline
-```
-
-The cleaning stage normalises timestamps, coerces numeric fields, drops rows with
-missing/out-of-range coordinates or missing vessel IDs, removes negative (physically
-invalid) speeds, normalises heading to `[0, 360)` (treating `0` as a valid direction and
-the AIS `511` value as "not available"), and removes **exact** duplicate
-`(vessel_id, timestamp, latitude, longitude)` records. It does **not** interpolate,
-resample, reconstruct, or infer anything, and never fabricates movement values. It returns
-a deterministic data-quality report (input/output rows, rows removed by category, unique
-vessels), which the dashboard surfaces in Historical AIS mode.
-
-> On the bundled Danish sample, cleaning removes a large number of **exact-duplicate
-> broadcasts** (common for moored/anchored vessels and redundant feed records) while
-> preserving every vessel. This is expected and is not data loss.
-
-### Monitoring / restricted zones (configurable)
-
-Geofencing zones are **configurable per data source** (`zones.py`) — the ray-casting
-geofencing algorithm itself is unchanged and shared by both modes:
-
-- **Simulated** → Bay of Bengal **demonstration restricted zones** (for the synthetic
-  fleet). Unchanged from earlier rounds.
-- **Historical AIS** → Danish-waters **demonstration monitoring zones**, placed over
-  regions where the sample dataset actually has dense vessel traffic (Øresund, Skagerrak,
-  North Sea).
-
-> The Danish polygons are **demonstration monitoring zones only**. They are **not**
-> authoritative Danish restricted, protected, or fishing-closure areas, and must not be
-> interpreted as legally restricted waters. They exist solely to exercise the geofencing
-> pipeline against real vessel positions.
+Geofencing zones are configurable per data source; the ray-casting
+point-in-polygon algorithm is shared and unchanged. Simulated → Bay of Bengal
+demonstration restricted zones; Historical/Replay → Danish demonstration
+monitoring zones. The Danish polygons are **demonstration monitoring zones
+only**, not legally restricted waters.
 
 ---
 
-## Persistence (local history)
+## Behavioural analysis (`behavior_analysis.py`)
 
-Each completed pipeline run is persisted to a **local SQLite database** (`database.py`,
-Python standard-library `sqlite3` — no external database dependency). The database is a
-**history / sink layer only**: the in-memory detection pipeline runs independently of it,
-and if persistence fails the pipeline results and dashboard still render (a warning is
-shown). It is a local application history, not cloud storage.
-
-**Database location:** `data/ifds.db` (created on first run; git-ignored — not committed).
-
-**Stored entities:**
-
-| Table | Contents |
-|---|---|
-| `vessels` | one row per vessel (UPSERT — no duplicates), with source and region |
-| `positions` | cleaned AIS positions; `UNIQUE(vessel_id, timestamp, latitude, longitude, source)` with `INSERT OR IGNORE` so repeated runs do not duplicate |
-| `features` | per-vessel engineered feature values, stored as JSON, stamped with a run timestamp |
-| `anomaly_scores` | Isolation Forest score + anomalous flag per vessel per run |
-| `risk_scores` | risk score, level, zone status, behaviour, AIS gap, per vessel per run |
-| `alerts` | generated alerts (vessel, level, message, reason, timestamp) |
-
-Writes use a single connection, one transaction, and `executemany()` for speed. In
-Historical AIS mode the **cleaned** positions are stored (not the raw rows and not the
-original large CSV). The dashboard shows a **Stored History** panel (counts, recent alerts,
-recent risk assessments) and the vessel inspector shows a per-vessel recent-history list.
-
-> This persists an unsupervised anomaly/suspicious-behaviour history. It does not record a
-> determination that any vessel was fishing illegally.
+Derives explainable indicators from each vessel's ordered trajectory: Haversine
+distance travelled; average/max speed and speed variability; mean/max heading
+change and turning rate; stationary ratio; a loitering score (spatial
+containment + stationarity); AIS reporting gaps (max/mean + significant-gap
+count); trajectory duration; position count. A transparent, non-ML multi-label
+classification (`NORMAL_TRANSIT`, `SLOW_MOVEMENT`, `LOITERING`, `HIGH_TURNING`,
+`AIS_GAP`, `SPEED_ANOMALY`, `MIXED_SUSPICIOUS`, `INSUFFICIENT_DATA`) and a
+plain-language summary accompany the numeric features. These are **suspicious
+behaviour indicators**, not proof of illegal fishing.
 
 ---
 
-## Behavioural Analysis
+## Isolation Forest (`anomaly_detector.py`, `model_manager.py`)
 
-IFDS derives explainable **behavioural indicators** from each vessel's ordered trajectory
-(`behavior_analysis.py`). These move the system beyond single-point/latest-position
-scoring toward trajectory-aware analysis that helps explain *why* a vessel may be
-suspicious. Indicators include:
-
-- **Distance travelled** (Haversine great-circle distance over consecutive positions)
-- **Speed statistics** — average, maximum, variability (std), and speed-change rate
-- **Heading / turning behaviour** — mean/max heading change (normalised to [-180, 180])
-  and a time-based turning rate
-- **Stationary ratio** — share of observations at or below a low-speed threshold (1.0 kn)
-- **Loitering score** [0, 1] — combines spatial containment (bounding-box spread vs
-  distance travelled) with stationarity; a vessel covering little net ground relative to
-  how far it moved, while slow, scores high
-- **AIS reporting gaps** — maximum and mean gap, and a count of significant gaps
-  (≥ 30 min) derived from timestamps
-- **Trajectory duration** and **position count**
-
-Each vessel also receives a transparent, non-ML, multi-label classification
-(`NORMAL_TRANSIT`, `SLOW_MOVEMENT`, `LOITERING`, `HIGH_TURNING`, `AIS_GAP`,
-`SPEED_ANOMALY`, `MIXED_SUSPICIOUS`, or `INSUFFICIENT_DATA`) and a plain-language summary.
-The numeric indicators are appended to the Isolation Forest feature matrix (numeric only),
-and the risk engine exposes an explainable `risk_factors` list per vessel. In Historical
-AIS mode the vessel inspector shows a Behaviour Analysis panel and the map draws the
-selected vessel's **actual** chronological AIS track.
-
-> These indicators identify **potentially suspicious maritime behaviour**. They do not
-> independently prove illegal fishing.
+An **unsupervised** Isolation Forest (200 estimators, contamination 0.20,
+`random_state=42`) scores each vessel's 21-feature row; `decision_function`
+output is inverted and min-max normalised to a `[0, 1]` anomaly score. The model
+follows a **train-once / load-reuse** lifecycle: it is trained on first run and
+saved to `models/isolation_forest.joblib`; later runs reuse the saved artifact
+after a compatibility check (feature count, names, order, model version). A
+missing/corrupt/incompatible artifact triggers a safe retrain.
 
 ---
 
-## Technology Stack
+## Temporal model (`temporal_model.py`, `temporal_model_manager.py`)
 
-| Library | Purpose |
-|---|---|
-| Python 3.10+ | Core language |
-| Streamlit 1.53 | Web dashboard framework |
-| Pandas 2.x | Data manipulation |
-| NumPy 2.x | Numerical operations |
-| Folium 0.20 | Interactive map rendering |
-| streamlit-folium 0.27 | Folium → Streamlit bridge |
-| scikit-learn 1.8 | Isolation Forest anomaly detection |
+An **unsupervised** temporal **sequence** anomaly detector implemented as a
+scikit-learn **PCA sequence autoencoder** (no deep-learning dependency). It
+builds fixed-length windows (`sequence_length=10`) from six per-step features
+(speed, heading change, lat/lon change, step distance, time gap), compresses and
+reconstructs them, and uses the reconstruction error (normalised to `[0, 1]`
+against a stored training reference) as a `temporal_anomaly_score`. It evaluates
+behaviour **across time windows** rather than independent points. Vessels with
+too few observations return score 0 and status `insufficient_data`. The model is
+persisted (`models/temporal_model.joblib`) with the same train-once / load-reuse
+lifecycle and compatibility checks.
 
-No additional external dependencies are required.
+> This is a PCA-based linear sequence autoencoder, chosen for a reliable,
+> dependency-light implementation. It is not an LSTM/GRU.
 
 ---
 
-## Project Structure
+## Unified risk engine (`risk_engine.py`)
+
+A single canonical scoring path combines five normalised `[0, 1]` components,
+each counted **exactly once**, with documented weights:
+
+| Component | Weight | Meaning |
+|---|---|---|
+| Geofence | 0.30 | inside a monitoring zone (1.0) / proximity fraction |
+| Isolation Forest | 0.25 | point anomaly score |
+| Temporal | 0.15 | sequence anomaly score (0 when unavailable) |
+| Behaviour | 0.20 | max of loitering / speed / erratic / turning |
+| AIS gap | 0.10 | single unified gap signal (no double-counting) |
+
+`overall_score = 100 × Σ(weightᵢ × componentᵢ)`; **HIGH ≥ 55**, **MEDIUM ≥ 20**,
+else **LOW**. Each vessel exposes the component values, a weighted factor
+breakdown, an explainable `risk_factors` list, and a plain-language explanation.
+Wording is deliberately phrased as *"suspicious fishing-related behaviour
+indicators"* — never confirmed illegal fishing.
+
+---
+
+## Real-time replay simulation (`realtime_simulator.py`, `alert_engine.py`)
+
+The replay mode orders the cleaned historical AIS stream by timestamp and emits
+it in configurable **ticks**. Per-vessel current state and a capped recent-track
+window are maintained; risk is computed only for currently active vessels each
+tick. The `AlertEngine` raises alerts (HIGH_RISK, ZONE_ENTRY, AIS_GAP,
+BEHAVIOUR_ANOMALY, TEMPORAL_ANOMALY, COMBINED) with a per-(vessel, type)
+**cooldown** to prevent spam, and persists them to SQLite. Stepping is driven by
+Streamlit session state with bounded `st.rerun()` — there is no runaway loop.
+The UI states plainly that this is a replay of historical data and **not a live
+AIS feed**.
+
+---
+
+## SQLite persistence (`database.py`)
+
+A local SQLite database (`data/ifds.db`) acts as a **history sink** — the
+detection pipeline runs independently of it, and persistence failures surface a
+warning without breaking the dashboard. Tables: `vessels` (UPSERT), `positions`
+(deduplicated), `features` (JSON), `anomaly_scores`, `risk_scores`, `alerts`.
+It is local application history, not cloud storage.
+
+---
+
+## Dashboard (`app.py`)
+
+Sections: system overview header, data-source selector, fleet risk metrics,
+interactive map (zones, trails, real historical track for a selected vessel),
+alerts, vessel inspector (position, risk, behaviour analysis, Isolation Forest +
+temporal scores, risk factors), ML model status, stored history, and a system
+information panel. The Real-Time Simulation mode shows live metrics, a replay
+map, and the latest deduplicated alerts.
+
+---
+
+## Project structure
 
 ```
 illegal-fishing-detection/
 │
-├── app.py                  # Streamlit dashboard — UI and pipeline orchestration
-├── data_generator.py       # Simulated vessel fleet, trajectory generation, AIS gap data
-├── ais_loader.py           # Historical AIS CSV ingestion + normalisation (Historical AIS mode)
-├── data_processing.py      # Deterministic AIS cleaning + data-quality report (Historical AIS mode)
-├── zones.py                # Source-aware zone configuration (Bay of Bengal / Danish demo)
-├── map_builder.py          # Folium map construction (zones, trails, markers, legend)
-├── geofencing.py           # Point-in-polygon zone detection and proximity scoring
-├── feature_engineering.py  # Behavioural feature extraction from trajectories
-├── behavior_analysis.py    # Trajectory & behaviour metrics + classification (M4)
-├── anomaly_detector.py     # Isolation Forest scoring (train-once / load-reuse)
-├── model_manager.py        # Persistent model lifecycle: train/save/load/compat (M5)
-├── risk_engine.py          # Weighted risk scoring, classification, alert generation
+├── app.py                      # Streamlit dashboard + pipeline orchestration
+├── data_generator.py           # Simulated fleet, trajectories, zones accessor
+├── ais_loader.py               # Historical AIS CSV ingestion + normalisation
+├── data_processing.py          # Deterministic AIS cleaning + quality report
+├── zones.py                    # Source-aware monitoring/zone configuration
+├── geofencing.py               # Ray-casting point-in-polygon zone detection
+├── feature_engineering.py      # 9 base + 12 behavioural = 21 numeric features
+├── behavior_analysis.py        # Trajectory & behaviour metrics + classification
+├── anomaly_detector.py         # Isolation Forest scoring (train-once/load)
+├── model_manager.py            # Isolation Forest persistent lifecycle (joblib)
+├── temporal_model.py           # PCA sequence autoencoder (temporal anomaly)
+├── temporal_model_manager.py   # Temporal model persistent lifecycle (joblib)
+├── risk_engine.py              # Unified risk scoring + alert generation
+├── realtime_simulator.py       # AIS replay simulation (tick-driven)
+├── alert_engine.py             # Alert triggering with dedup/cooldown
+├── map_builder.py              # Folium map construction
+├── database.py                 # SQLite persistence (history sink)
 │
-├── database.py             # SQLite persistence layer (local history sink)
+├── test_ais_loader.py
+├── test_data_processing.py
+├── test_database.py
+├── test_behavior_analysis.py
+├── test_model_manager.py
+├── test_temporal_model.py
+├── test_temporal_model_manager.py
+├── test_risk_engine.py
+├── test_realtime_simulation.py
 │
-├── test_ais_loader.py      # Focused tests for the AIS ingestion layer
-├── test_data_processing.py # Tests for AIS cleaning + zone configuration
-├── test_database.py        # Tests for SQLite persistence (temp DB)
-├── test_behavior_analysis.py # Tests for trajectory & behaviour analysis
-├── test_model_manager.py   # Tests for persistent model lifecycle (temp artifacts)
 ├── data/
-│   ├── ifds_ais_sample.csv # Historical AIS sample — Danish waters, 2025-02-27 (~100k rows)
-│   ├── ifds.db             # SQLite runtime history (git-ignored, created on first run)
-│   ├── sample_ais.csv      # Tiny synthetic TEST FIXTURE (not real AIS data)
-│   └── README.md           # Notes on the data directory and real AIS usage
-├── models/                 # Trained model artifact (git-ignored, created on first run)
-│   └── isolation_forest.joblib
+│   ├── ifds_ais_sample.csv     # Historical AIS sample — Danish waters (~9 MB, tracked)
+│   ├── sample_ais.csv          # Tiny synthetic test fixture (not real AIS)
+│   ├── ifds.db                 # SQLite runtime history (git-ignored)
+│   └── README.md
+├── models/                     # Trained model artifacts (git-ignored, runtime)
+│   ├── isolation_forest.joblib
+│   └── temporal_model.joblib
 │
-├── requirements.txt        # Pinned Python dependencies
-├── .gitignore              # Excludes venv, __pycache__, secrets, raw datasets, models
-└── README.md               # This file
+├── requirements.txt
+├── .gitignore
+└── README.md
 ```
 
 ---
@@ -369,204 +305,101 @@ illegal-fishing-detection/
 ## Installation
 
 ### Prerequisites
-
 - Python 3.10 or later
 - Git
 
-### Clone the repository
-
+### Steps (Windows PowerShell)
 ```powershell
 git clone https://github.com/InfoNaveen/illegal-fishing-detection.git
 cd illegal-fishing-detection
-```
-
-### Create a virtual environment
-
-```powershell
 python -m venv .venv
-```
-
-### Activate the virtual environment
-
-**Windows PowerShell:**
-```powershell
 .venv\Scripts\Activate.ps1
-```
-
-**Windows Command Prompt:**
-```cmd
-.venv\Scripts\activate.bat
-```
-
-**macOS / Linux:**
-```bash
-source .venv/bin/activate
-```
-
-### Install dependencies
-
-```powershell
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+macOS / Linux: activate with `source .venv/bin/activate`.
 
-### Run the application
+---
+
+## Running locally
 
 ```powershell
 python -m streamlit run app.py
 ```
+Open **http://localhost:8501**. Health check: `http://localhost:8501/_stcore/health`
+returns `ok`.
 
-Streamlit will print a local URL — open it in your browser:
-
-```
-http://localhost:8501
-```
+First run trains and saves the two models under `models/` (a few seconds);
+subsequent runs reuse them.
 
 ---
 
-## Troubleshooting
+## Configuration
 
-**`python` not recognised**
-Ensure Python is installed and added to your system PATH. Download from
-[python.org](https://www.python.org/downloads/).
+- **AIS CSV path:** `ais_loader.DEFAULT_AIS_CSV_PATH` (default
+  `data/ifds_ais_sample.csv`).
+- **Database path:** `database.DEFAULT_DB_PATH` (default `data/ifds.db`).
+- **Model paths:** `models/isolation_forest.joblib`, `models/temporal_model.joblib`.
+- **Risk weights / thresholds:** documented constants in `risk_engine.py`.
+- **Temporal sequence length / hidden size:** `temporal_model.py`.
+- **Replay ticks / alert cooldown:** `realtime_simulator.py`, `alert_engine.py`.
 
-**Virtual environment activation blocked (PowerShell)**
-Run the following once to allow local script execution:
+---
+
+## Testing
+
 ```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+python -m pytest -q
 ```
-
-**Dependency installation errors**
-Upgrade pip first, then retry:
-```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-**Port 8501 already in use**
-Run on a different port:
-```powershell
-python -m streamlit run app.py --server.port 8502
-```
+Nine suites cover ingestion, cleaning, persistence, behaviour analysis, both
+model lifecycles (including train-once reuse proofs), the unified risk engine
+(component isolation, no double-count, thresholds, V102/V087/V215 regression),
+and the replay simulation (ordering, state, alert cooldown, DB persistence).
 
 ---
 
-## Demonstration Flow
+## Deployment
 
-1. Start the dashboard with `python -m streamlit run app.py`
-2. Open `http://localhost:8501` in your browser
-3. Observe the fleet on the interactive map — red markers indicate HIGH-risk vessels
-4. Note the three restricted fishing zones drawn on the map
-5. Open the sidebar and select a vessel ID (e.g. **V102** or **V087**)
-6. View the vessel's computed behavioural feature values
-7. View the Isolation Forest anomaly score
-8. View the dynamic risk score and contributing factors
-9. Review the alerts panel — HIGH alerts appear at the top
+The app runs with `streamlit run app.py`. The deployed app depends only on the
+tracked ~9 MB historical sample — **not** on the original large raw AIS CSV. The
+SQLite database and model artifacts are generated at runtime and are
+git-ignored; they must not be committed.
 
 ---
 
-## Risk Detection Methodology
+## Limitations
 
-Risk scores are calculated by combining geofencing results, behavioural features, and
-machine-learning anomaly scores using a fixed weighted formula. The formula is
-intentionally transparent and explainable.
-
-The current weights and thresholds are prototype values chosen to produce a demonstrable
-risk distribution across the simulated fleet. **They have not been validated against real
-maritime enforcement data and should not be used to make operational decisions.**
-
----
-
-## Machine Learning
-
-The system uses **Isolation Forest**, an unsupervised anomaly detection algorithm
-well-suited to small, unlabelled datasets.
-
-**How it works in this system:**
-1. A feature matrix is constructed from the vessel fleet (the 9 base features plus the
-   12 M4 behavioural features = 21 columns per vessel)
-2. An Isolation Forest model scores the matrix — trained once and then reused from a saved
-   artifact on later runs (see Persistent ML Model below)
-3. The model's `decision_function` scores each vessel — vessels that are harder to
-   isolate (require more splits) score as more normal
-4. Scores are inverted and min-max normalised to `[0, 1]`
-5. The resulting anomaly score is used as one input to the risk engine
-
-**Important:** No labelled training data (confirmed illegal fishing cases) is used. The
-model identifies statistical outliers within the current fleet, not absolute criminality.
-Isolation Forest does not generalise beyond the data it was fitted on.
-
-### Persistent ML Model
-
-The Isolation Forest is **unsupervised** and follows a train-once / reuse lifecycle
-(`model_manager.py`, serialized with `joblib`):
-
-- On the first run (or when no compatible artifact exists) the model is **trained** on the
-  current feature matrix and saved to `models/isolation_forest.joblib`.
-- On subsequent runs a **compatible saved artifact is loaded and reused** — the model is
-  not re-fitted, which avoids repeated training cost.
-- Before reuse, the artifact is validated against the current feature pipeline: it must
-  deserialize cleanly, carry metadata, and match the feature **count**, **names**, and
-  **order**, plus the model version. Any mismatch — or a corrupted artifact — triggers a
-  safe **retrain** that overwrites the invalid file; the pipeline never crashes.
-- The saved artifact bundles the fitted model, the fitted scaler, and metadata
-  (`feature_columns`, `feature_count`, `random_state`, `contamination`, `n_estimators`,
-  `trained_at`, `model_version`). Configuration is unchanged: 200 estimators,
-  contamination 0.20, random_state 42.
-- The dashboard reports whether the current run **loaded** or **trained** the model.
-
-The model artifact is **local and git-ignored** (`models/`); it is never committed, never
-stored in SQLite, and the raw AIS dataset is never used for training. No labelled
-illegal-fishing ground truth exists, so this remains anomaly detection — no accuracy,
-precision, recall, or F1 is claimed.
+- Default fleet is **simulated**; Historical/Replay modes read a **local CSV
+  only** — no live AIS feed or real-time data source.
+- The bundled sample is historical Danish AIS; monitoring zones are
+  **demonstration** zones, not authoritative legal boundaries.
+- No labelled illegal-fishing ground truth → **no accuracy/precision/recall/F1**
+  is claimed. Both models are unsupervised.
+- The temporal model is a PCA sequence autoencoder, not an LSTM/GRU.
+- Risk weights and thresholds are prototype values, not domain-calibrated.
+- Persistence is a local SQLite history sink, not an operational data store.
 
 ---
 
-## Current Limitations
+## Future improvements
 
-- The default fleet is **simulated**; Historical AIS mode reads a **local CSV only** —
-  there is still no live AIS feed or real-time data source
-- The bundled `data/sample_ais.csv` is a synthetic test fixture, not real AIS data
-- Behavioural indicators are now derived from each vessel's full ordered trajectory, but
-  anomaly scoring still uses the current (latest) position as the vessel row; deeper
-  sequence/temporal modelling (e.g. LSTM/GRU) is future work
-- Simulated fleet size is 18 vessels — too small for a statistically robust anomaly model
-- The Isolation Forest model is trained once and reused from a saved artifact; it retrains
-  only when the artifact is missing, corrupted, or incompatible with the feature schema
-- Risk weights and classification thresholds are prototype values, not domain-calibrated
-- Persistence is a **local SQLite history sink**; it is not a live operational data store
-- No authentication or access control
-- No real-time alert delivery (email, SMS, etc.)
-- Simulated AIS gap durations are deterministic demo values, not computed from actual signal logs
+- Integration with a real/authorised AIS data source
+- Domain-validated zones and risk calibration
+- Labelled evaluation data to enable supervised metrics
+- Richer temporal modelling (e.g. recurrent networks) if resources allow
+- Longer-horizon historical tracking and analyst workflow tooling
 
 ---
 
-## Future Enhancements
+## Ethical / operational disclaimer
 
-The following are identified as **future work** and are not currently implemented:
-
-- Integration with real AIS data feeds (e.g. MarineTraffic, exactEarth)
-- Historical vessel tracking with persistent storage
-- Persistent trained model (save/load via joblib or ONNX)
-- Larger, more representative training datasets
-- Temporal anomaly detection using LSTM or GRU sequence models
-- Domain-calibrated risk weights validated against enforcement records
-- Database backend for vessel history and alert logging
-- Real-time alert delivery (email, webhook, mobile push)
-- Production deployment (containerised, cloud-hosted)
-- Role-based access control and audit logging
-- Multi-region zone configuration via admin interface
-
----
-
-## Disclaimer
-
-This is a **prototype and academic implementation**. The simulated vessel data,
-synthetic trajectories, demonstration AIS gaps, and uncalibrated risk thresholds are
-not suitable for operational maritime surveillance or law-enforcement decision-making.
-Any real-world application of this system would require integration with verified AIS
-data sources, domain expert calibration, and appropriate legal and regulatory review.
-
----
+This system is a prototype and academic demonstrator. It identifies
+**anomalous / suspicious maritime movement behaviour** using unsupervised
+methods on historical and simulated data. It does **not** prove illegal fishing,
+is **not** a live surveillance system, uses **demonstration** monitoring zones,
+and must **not** be used for operational maritime enforcement decisions. Any
+real-world use would require authorised data sources, domain-expert calibration,
+and appropriate legal and regulatory review.
 
 ## License
 
