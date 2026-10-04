@@ -50,6 +50,10 @@ from database import DatabaseError, DEFAULT_DB_PATH
 from behavior_analysis import analyze_all
 # ── Round 3 M6: temporal sequence anomaly detection ─────────────────────────
 from temporal_model_manager import run_temporal_detection
+# ── Round 3 M8: real-time AIS replay simulation + alerts ────────────────────
+from realtime_simulator import AISReplaySimulator, DEFAULT_TICKS
+from alert_engine import AlertEngine, DEFAULT_COOLDOWN_TICKS
+from zones import get_zones as _get_zones_rt
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -308,6 +312,37 @@ def run_pipeline(source: str = "Simulated",
 
 
 # ---------------------------------------------------------------------------
+# Real-Time Simulation helpers (M8). Risk is computed only for the simulator's
+# currently-active vessels each tick — not the whole dataset.
+# ---------------------------------------------------------------------------
+
+def compute_live_risk(state_df, recent_tracks, zones):
+    """
+    Compute unified risk for the simulator's current vessel state.
+
+    state_df      : one-row-per-vessel current positions (from the simulator)
+    recent_tracks : {vessel_id: recent-trajectory DataFrame}
+    zones         : Danish demonstration monitoring zones
+
+    Returns {vessel_id: unified_risk_result}. Uses the same geofencing,
+    behaviour, feature, Isolation Forest and unified risk engine as the batch
+    pipeline — temporal is included when a recent window is long enough.
+    """
+    if state_df is None or state_df.empty:
+        return {}
+    behavior_map = analyze_all(recent_tracks)
+    geo_list = run_geofencing(state_df, zones)
+    geo_map = {g["vessel_id"]: g for g in geo_list}
+    feature_df = build_feature_matrix(state_df, recent_tracks, geo_map,
+                                      behavior_map=behavior_map)
+    anomaly_map, _st, _m = run_anomaly_detection_with_status(feature_df)
+    temporal_map, _ts, _tm = run_temporal_detection(recent_tracks)
+    return run_risk_engine(state_df["vessel_id"].tolist(), geo_map, feature_df,
+                           anomaly_map, behavior_map=behavior_map,
+                           temporal_map=temporal_map)
+
+
+# ---------------------------------------------------------------------------
 # Data source selection (Round 3 M1) — chosen in the sidebar below, but read
 # here so the pipeline runs with the correct source. Default is "Simulated".
 # ---------------------------------------------------------------------------
@@ -316,21 +351,25 @@ if "data_source" not in st.session_state:
 
 _active_source = st.session_state["data_source"]
 _ais_error_message = ""
+_REALTIME_MODE = (_active_source == "Real-Time Simulation")
 
-try:
-    df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
-        source=_active_source,
-        csv_path=DEFAULT_AIS_CSV_PATH,
-    )
-except (AISFileError, AISColumnError) as exc:
-    # Historical AIS unavailable/invalid — fall back to simulated so the
-    # dashboard never crashes, and surface a clear message in the sidebar.
-    _ais_error_message = str(exc)
-    _active_source = "Simulated"
-    df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
-        source="Simulated",
-        csv_path=DEFAULT_AIS_CSV_PATH,
-    )
+# Batch pipeline runs only for the two batch modes. Real-Time Simulation uses
+# a separate tick-driven path (rendered later) and does not run run_pipeline().
+if not _REALTIME_MODE:
+    try:
+        df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
+            source=_active_source,
+            csv_path=DEFAULT_AIS_CSV_PATH,
+        )
+    except (AISFileError, AISColumnError) as exc:
+        # Historical AIS unavailable/invalid — fall back to simulated so the
+        # dashboard never crashes, and surface a clear message in the sidebar.
+        _ais_error_message = str(exc)
+        _active_source = "Simulated"
+        df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
+            source="Simulated",
+            csv_path=DEFAULT_AIS_CSV_PATH,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -361,17 +400,19 @@ def _persist_once(source: str, _df, _feat, _anom, _risk, _alerts, region, _posit
     )
 
 
-try:
-    _persist_counts = _persist_once(
-        _active_source, df, feature_df, anomaly_map, risk_map, alerts,
-        pipeline_meta["region"], pipeline_meta.get("positions_df"),
-    )
-except DatabaseError as exc:
-    _persist_warning = f"Persistence unavailable (results still shown): {exc}"
-    _persist_counts = {}
-except Exception as exc:  # defensive: persistence must never kill the app
-    _persist_warning = f"Persistence skipped (results still shown): {exc}"
-    _persist_counts = {}
+_persist_counts = {}
+if not _REALTIME_MODE:
+    try:
+        _persist_counts = _persist_once(
+            _active_source, df, feature_df, anomaly_map, risk_map, alerts,
+            pipeline_meta["region"], pipeline_meta.get("positions_df"),
+        )
+    except DatabaseError as exc:
+        _persist_warning = f"Persistence unavailable (results still shown): {exc}"
+        _persist_counts = {}
+    except Exception as exc:  # defensive: persistence must never kill the app
+        _persist_warning = f"Persistence skipped (results still shown): {exc}"
+        _persist_counts = {}
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +432,10 @@ def _compute_stats(df: pd.DataFrame, alerts: list) -> dict:
         "active_alerts": active,
     }
 
-stats = _compute_stats(df, alerts)
+stats = _compute_stats(df, alerts) if not _REALTIME_MODE else {
+    "total_vessels": 0, "high_risk": 0, "medium_risk": 0,
+    "low_risk": 0, "active_alerts": 0,
+}
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -417,11 +461,21 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.radio(
         "Data Source",
-        options=["Simulated", "Historical AIS"],
+        options=["Simulated", "Historical AIS", "Real-Time Simulation"],
         key="data_source",
         label_visibility="collapsed",
     )
-    if _active_source == "Historical AIS" and not _ais_error_message:
+    if _REALTIME_MODE:
+        st.markdown(
+            '<div style="font-size:0.68rem;color:#ff8c00;margin:-4px 0 4px;">'
+            '● AIS Replay Simulation</div>'
+            '<div style="font-size:0.62rem;color:#5a7aa5;margin-bottom:10px;'
+            'line-height:1.5;">Replay simulation using historical AIS data. '
+            '<b>Not a live AIS feed.</b></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Replay controls are in the main panel →")
+    elif _active_source == "Historical AIS" and not _ais_error_message:
         _qr = pipeline_meta.get("quality_report", {})
         st.markdown(
             '<div style="font-size:0.68rem;color:#2ECC71;margin:-4px 0 6px;">'
@@ -474,14 +528,17 @@ with st.sidebar:
         )
 
     # ── ML model status (M5) ─────────────────────────────────────────────
-    _ms = pipeline_meta.get("model_status", "ready")
+    if _REALTIME_MODE:
+        _ms = "ready"
+    else:
+        _ms = pipeline_meta.get("model_status", "ready")
     _ms_label = {
         "loaded":    ("● Loaded existing model", "#2ECC71"),
         "trained":   ("● Trained new model",      "#00d4ff"),
         "retrained": ("● Retrained model (schema changed)", "#FF8C00"),
         "in-memory": ("● In-memory model",         "#8899bb"),
     }.get(_ms, ("● Model ready", "#8899bb"))
-    _ts = pipeline_meta.get("temporal_status", "ready")
+    _ts = "ready" if _REALTIME_MODE else pipeline_meta.get("temporal_status", "ready")
     _ts_label = {
         "loaded":    ("● Temporal model loaded", "#2ECC71"),
         "trained":   ("● Temporal model trained", "#00d4ff"),
@@ -501,14 +558,15 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
-                unsafe_allow_html=True)
+    selected_vessel = "— Select a vessel —"
+    if not _REALTIME_MODE:
+        st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
+                    unsafe_allow_html=True)
+        vessel_ids_sorted = ["— Select a vessel —"] + sorted(df["vessel_id"].tolist())
+        selected_vessel   = st.selectbox("Vessel ID", vessel_ids_sorted,
+                                         label_visibility="collapsed")
 
-    vessel_ids_sorted = ["— Select a vessel —"] + sorted(df["vessel_id"].tolist())
-    selected_vessel   = st.selectbox("Vessel ID", vessel_ids_sorted,
-                                     label_visibility="collapsed")
-
-    if selected_vessel != "— Select a vessel —":
+    if (not _REALTIME_MODE) and selected_vessel != "— Select a vessel —":
         row         = df[df["vessel_id"] == selected_vessel].iloc[0]
         risk_colour = _RISK_COLOURS.get(row["risk_level"], "#888")
         risk_result = risk_map[selected_vessel]
@@ -722,12 +780,177 @@ with st.sidebar:
                 </div>""", unsafe_allow_html=True)
 
     st.markdown('<hr style="border-color:#1e2d50;margin:20px 0 12px;">', unsafe_allow_html=True)
+    _footer_region = ("Danish Waters" if _REALTIME_MODE
+                      else pipeline_meta.get('region', 'Bay of Bengal'))
     st.markdown(f"""
     <div style="font-size:0.68rem;color:#2a4060;text-align:center;line-height:1.6;">
       Live Detection Pipeline · Isolation Forest<br>
-      {pipeline_meta.get('region', 'Bay of Bengal')} · Maritime Surveillance
+      {_footer_region} · Maritime Surveillance
     </div>
     """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Simulation main view (M8). Rendered instead of the batch dashboard.
+# Controlled, session-state-driven stepping — no infinite loop.
+# ---------------------------------------------------------------------------
+if _REALTIME_MODE:
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:16px;padding:18px 24px;
+                margin-bottom:14px;background:linear-gradient(90deg,#2a1500 0%,#080c1a 100%);
+                border-bottom:1px solid #5a3a00;border-radius:0 0 8px 8px;">
+      <div style="font-size:2.3rem;">📡</div>
+      <div>
+        <div style="font-size:1.4rem;font-weight:700;color:#ff8c00;letter-spacing:0.05em;">
+          AIS Replay Simulation
+        </div>
+        <div style="font-size:0.74rem;color:#b08040;letter-spacing:0.08em;margin-top:2px;">
+          REPLAY OF HISTORICAL AIS DATA · DANISH WATERS · NOT A LIVE AIS FEED
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.warning("This is a controlled **replay simulation using historical AIS "
+               "data** (2025-02-27, Danish waters). It is **not a live AIS feed** "
+               "and does not receive vessels in real time.")
+
+    # ── Session state init ────────────────────────────────────────────────
+    try:
+        if "rt_sim" not in st.session_state:
+            database.initialize_database(DEFAULT_DB_PATH)
+            st.session_state["rt_sim"] = AISReplaySimulator.from_csv(
+                DEFAULT_AIS_CSV_PATH, n_ticks=DEFAULT_TICKS)
+            st.session_state["rt_alert_engine"] = AlertEngine(DEFAULT_COOLDOWN_TICKS)
+            st.session_state["rt_alerts"] = []
+            st.session_state["rt_running"] = False
+        _sim = st.session_state["rt_sim"]
+        _ae = st.session_state["rt_alert_engine"]
+    except Exception as exc:
+        st.error(f"Could not start replay simulation: {exc}")
+        st.stop()
+
+    _rt_zones = _get_zones_rt("Historical AIS")
+
+    # ── Controls ──────────────────────────────────────────────────────────
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
+    with cc1:
+        if st.button("▶ Step", use_container_width=True):
+            st.session_state["rt_running"] = False
+            _emitted = _sim.advance()
+            if _emitted:
+                _risk = compute_live_risk(_sim.state_dataframe(),
+                                          {v: _sim.recent_track(v) for v in _sim.active_vessel_ids()},
+                                          _rt_zones)
+                _new = _ae.evaluate(_risk, _sim.tick_index)
+                if _new:
+                    try:
+                        database.insert_alerts(_new, DEFAULT_DB_PATH)
+                    except Exception:
+                        pass
+                    st.session_state["rt_alerts"] = (_new + st.session_state["rt_alerts"])[:50]
+                st.session_state["rt_live_risk"] = _risk
+    with cc2:
+        if st.button("⏩ Auto ×5", use_container_width=True):
+            st.session_state["rt_running"] = True
+    with cc3:
+        if st.button("↺ Reset", use_container_width=True):
+            for k in ("rt_sim", "rt_alert_engine", "rt_alerts", "rt_running", "rt_live_risk"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    with cc4:
+        st.progress(min(_sim.progress, 1.0),
+                    text=f"Replay tick {_sim.tick_index}/{_sim.total_ticks}")
+
+    # ── Auto-stepping: advance a few ticks per rerun, then schedule a rerun.
+    #    Bounded (max 5 ticks) so the browser never freezes; stops at the end.
+    if st.session_state.get("rt_running") and not _sim.finished:
+        for _ in range(5):
+            if _sim.finished:
+                break
+            _emitted = _sim.advance()
+            if _emitted:
+                _risk = compute_live_risk(_sim.state_dataframe(),
+                                          {v: _sim.recent_track(v) for v in _sim.active_vessel_ids()},
+                                          _rt_zones)
+                _new = _ae.evaluate(_risk, _sim.tick_index)
+                if _new:
+                    try:
+                        database.insert_alerts(_new, DEFAULT_DB_PATH)
+                    except Exception:
+                        pass
+                    st.session_state["rt_alerts"] = (_new + st.session_state["rt_alerts"])[:50]
+                st.session_state["rt_live_risk"] = _risk
+        if _sim.finished:
+            st.session_state["rt_running"] = False
+        else:
+            st.rerun()
+
+    _live_risk = st.session_state.get("rt_live_risk", {})
+    _sim_time = _sim.current_sim_time()
+
+    # ── Live metrics ──────────────────────────────────────────────────────
+    _active = _sim.active_vessel_ids()
+    _high = sum(1 for r in _live_risk.values() if r["risk_level"] == "HIGH")
+    _med  = sum(1 for r in _live_risk.values() if r["risk_level"] == "MEDIUM")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("📡 Active Vessels", len(_active))
+    m2.metric("🔴 HIGH Risk", _high)
+    m3.metric("🟠 MEDIUM Risk", _med)
+    m4.metric("🚨 Alerts (session)", len(st.session_state.get("rt_alerts", [])))
+    m5.metric("⏱️ Replay", f"{int(_sim.progress*100)}%")
+    if _sim_time is not None:
+        st.caption(f"Current simulated timestamp: {_sim_time}")
+    if _sim.finished:
+        st.success("Replay complete.")
+
+    # ── Map + latest alerts ───────────────────────────────────────────────
+    rt_map_col, rt_alert_col = st.columns([3, 1], gap="medium")
+    with rt_map_col:
+        st.markdown('<div class="section-header">🗺️ Live Replay Map</div>',
+                    unsafe_allow_html=True)
+        _state_df = _sim.state_dataframe()
+        if not _state_df.empty and _live_risk:
+            _state_df = _state_df.copy()
+            _state_df["risk_level"] = _state_df["vessel_id"].map(
+                lambda v: _live_risk.get(v, {}).get("risk_level", "LOW"))
+            _state_df["risk_score"] = _state_df["vessel_id"].map(
+                lambda v: _live_risk.get(v, {}).get("overall_score", 0))
+            _state_df["zone_status"] = _state_df["vessel_id"].map(
+                lambda v: _live_risk.get(v, {}).get("zone_status", "Open Waters"))
+            fmap = build_map(_state_df, zones=_rt_zones, center=(56.5, 10.5), zoom=6)
+            st_folium(fmap, width=None, height=520, returned_objects=[])
+        else:
+            st.info("Press ▶ Step or ⏩ Auto to begin the replay.")
+    with rt_alert_col:
+        st.markdown('<div class="section-header">🚨 Latest Alerts</div>',
+                    unsafe_allow_html=True)
+        _rt_alerts = st.session_state.get("rt_alerts", [])
+        if not _rt_alerts:
+            st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No alerts yet.</p>',
+                        unsafe_allow_html=True)
+        for a in _rt_alerts[:10]:
+            css = "alert-high" if a["level"] == "HIGH" else "alert-medium"
+            st.markdown(f"""
+            <div class="{css}">
+              <div style="font-weight:700;font-size:0.8rem;">
+                {"🔴" if a["level"]=="HIGH" else "🟠"} {a['vessel_id']}
+                <span style="font-size:0.62rem;color:#4a6a9a;float:right;">
+                  {a['alert_type']}</span>
+              </div>
+              <div style="color:#b0c0d8;font-size:0.74rem;line-height:1.4;">
+                {a['message']}
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="text-align:center;padding:16px;border-top:1px solid #1e2d50;
+                color:#2a4060;font-size:0.7rem;letter-spacing:0.06em;margin-top:16px;">
+      ILLEGAL FISHING DETECTION SYSTEM · AIS REPLAY SIMULATION (HISTORICAL DATA)
+      &nbsp;|&nbsp; Not a live AIS feed · Danish Waters
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
 
 # ---------------------------------------------------------------------------

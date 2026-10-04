@@ -334,6 +334,40 @@ def persist_pipeline_run(
 # Query helpers (for the dashboard History section)
 # ---------------------------------------------------------------------------
 
+def insert_alerts(alert_rows: List[Dict],
+                  db_path: str = DEFAULT_DB_PATH) -> int:
+    """
+    Insert a batch of alert rows (M8 real-time replay).
+
+    Each row: {vessel_id, created_at, level, message, reason}. created_at
+    defaults to now if absent. Returns the number of rows written. Raises
+    DatabaseError on failure (caller treats as non-fatal).
+    """
+    if not alert_rows:
+        return 0
+    now = _utc_now()
+    try:
+        conn = get_connection(db_path)
+        conn.executescript(_SCHEMA)
+        try:
+            rows = [
+                (str(a["vessel_id"]), a.get("created_at", now),
+                 a.get("level"), a.get("message"), a.get("reason"))
+                for a in alert_rows
+            ]
+            conn.executemany(
+                """INSERT INTO alerts (vessel_id, created_at, level, message, reason)
+                   VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise DatabaseError(f"Alert insert failed: {exc}") from exc
+
+
 def get_history_summary(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
     """Return aggregate counts for the History panel."""
     try:
