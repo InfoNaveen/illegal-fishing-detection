@@ -49,11 +49,17 @@ def _risk_badge(risk_level: str) -> str:
 
 def _create_base_map(center: Tuple[float, float] = (12.5, 80.2),
                      zoom: int = 8) -> folium.Map:
-    """Return a dark-themed Folium map centred on the Bay of Bengal."""
+    """
+    Return a Folium map centred on the given location.
+
+    Uses OpenStreetMap tiles, which require no API key (the previous CartoDB
+    basemap could surface an "API KEY REQUIRED" overlay). center / zoom /
+    control_scale behaviour is unchanged.
+    """
     m = folium.Map(
         location=center,
         zoom_start=zoom,
-        tiles="CartoDB dark_matter",
+        tiles="OpenStreetMap",
         control_scale=True,
     )
     return m
