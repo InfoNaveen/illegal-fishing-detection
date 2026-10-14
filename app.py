@@ -54,6 +54,9 @@ from temporal_model_manager import run_temporal_detection
 from realtime_simulator import AISReplaySimulator, DEFAULT_TICKS
 from alert_engine import AlertEngine, DEFAULT_COOLDOWN_TICKS
 from zones import get_zones as _get_zones_rt
+# ── Live AIS integration (AISStream.io) ─────────────────────────────────────
+import live_ais
+from live_ais import LiveAISClient, get_api_key, LIVE_AIS_BBOX
 
 # ---------------------------------------------------------------------------
 # Page config — must be the first Streamlit call
@@ -330,10 +333,21 @@ def compute_live_risk(state_df, recent_tracks, zones):
     """
     if state_df is None or state_df.empty:
         return {}
+    # Behaviour analysis consumes the time-aware DataFrame tracks directly.
     behavior_map = analyze_all(recent_tracks)
+    # Feature extraction's geometric trajectory arg expects (lat, lon) tuple
+    # lists; convert the recent DataFrame tracks here so both consumers get the
+    # shape they expect.
+    tuple_tracks = {}
+    for _vid, _trk in recent_tracks.items():
+        try:
+            tuple_tracks[_vid] = list(zip(_trk["latitude"].tolist(),
+                                          _trk["longitude"].tolist()))
+        except Exception:
+            tuple_tracks[_vid] = []
     geo_list = run_geofencing(state_df, zones)
     geo_map = {g["vessel_id"]: g for g in geo_list}
-    feature_df = build_feature_matrix(state_df, recent_tracks, geo_map,
+    feature_df = build_feature_matrix(state_df, tuple_tracks, geo_map,
                                       behavior_map=behavior_map)
     anomaly_map, _st, _m = run_anomaly_detection_with_status(feature_df)
     temporal_map, _ts, _tm = run_temporal_detection(recent_tracks)
@@ -352,10 +366,11 @@ if "data_source" not in st.session_state:
 _active_source = st.session_state["data_source"]
 _ais_error_message = ""
 _REALTIME_MODE = (_active_source == "Real-Time Simulation")
+_LIVE_AIS_MODE = (_active_source == "Live AIS")
 
-# Batch pipeline runs only for the two batch modes. Real-Time Simulation uses
-# a separate tick-driven path (rendered later) and does not run run_pipeline().
-if not _REALTIME_MODE:
+# Batch pipeline runs only for the two batch modes. Real-Time Simulation and
+# Live AIS use separate paths (rendered later) and do not run run_pipeline().
+if not _REALTIME_MODE and not _LIVE_AIS_MODE:
     try:
         df, alerts, anomaly_map, risk_map, feature_df, pipeline_meta = run_pipeline(
             source=_active_source,
@@ -401,7 +416,7 @@ def _persist_once(source: str, _df, _feat, _anom, _risk, _alerts, region, _posit
 
 
 _persist_counts = {}
-if not _REALTIME_MODE:
+if not _REALTIME_MODE and not _LIVE_AIS_MODE:
     try:
         _persist_counts = _persist_once(
             _active_source, df, feature_df, anomaly_map, risk_map, alerts,
@@ -432,7 +447,7 @@ def _compute_stats(df: pd.DataFrame, alerts: list) -> dict:
         "active_alerts": active,
     }
 
-stats = _compute_stats(df, alerts) if not _REALTIME_MODE else {
+stats = _compute_stats(df, alerts) if not (_REALTIME_MODE or _LIVE_AIS_MODE) else {
     "total_vessels": 0, "high_risk": 0, "medium_risk": 0,
     "low_risk": 0, "active_alerts": 0,
 }
@@ -461,11 +476,29 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.radio(
         "Data Source",
-        options=["Simulated", "Historical AIS", "Real-Time Simulation"],
+        options=["Simulated", "Historical AIS", "Real-Time Simulation", "Live AIS"],
         key="data_source",
         label_visibility="collapsed",
     )
-    if _REALTIME_MODE:
+    if _LIVE_AIS_MODE:
+        _api_key_present = get_api_key() is not None
+        st.markdown(
+            ('<div style="font-size:0.68rem;color:#2ECC71;margin:-4px 0 4px;">'
+             '● Live AISStream data</div>' if _api_key_present else
+             '<div style="font-size:0.68rem;color:#FF8C00;margin:-4px 0 4px;">'
+             '● Live AIS not configured</div>'),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div style="font-size:0.62rem;color:#5a7aa5;margin-bottom:10px;'
+            'line-height:1.5;">Live AIS anomaly monitoring via AISStream.io. '
+            'Coverage depends on the external provider; vessels may be '
+            'delayed or missing. Suspicious fishing-related behaviour '
+            'indicators only — not confirmed illegal fishing.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Live AIS controls are in the main panel →")
+    elif _REALTIME_MODE:
         st.markdown(
             '<div style="font-size:0.68rem;color:#ff8c00;margin:-4px 0 4px;">'
             '● AIS Replay Simulation</div>'
@@ -528,7 +561,7 @@ with st.sidebar:
         )
 
     # ── ML model status (M5) ─────────────────────────────────────────────
-    if _REALTIME_MODE:
+    if _REALTIME_MODE or _LIVE_AIS_MODE:
         _ms = "ready"
     else:
         _ms = pipeline_meta.get("model_status", "ready")
@@ -538,7 +571,8 @@ with st.sidebar:
         "retrained": ("● Retrained model (schema changed)", "#FF8C00"),
         "in-memory": ("● In-memory model",         "#8899bb"),
     }.get(_ms, ("● Model ready", "#8899bb"))
-    _ts = "ready" if _REALTIME_MODE else pipeline_meta.get("temporal_status", "ready")
+    _ts = ("ready" if (_REALTIME_MODE or _LIVE_AIS_MODE)
+           else pipeline_meta.get("temporal_status", "ready"))
     _ts_label = {
         "loaded":    ("● Temporal model loaded", "#2ECC71"),
         "trained":   ("● Temporal model trained", "#00d4ff"),
@@ -559,14 +593,14 @@ with st.sidebar:
     )
 
     selected_vessel = "— Select a vessel —"
-    if not _REALTIME_MODE:
+    if not (_REALTIME_MODE or _LIVE_AIS_MODE):
         st.markdown('<div class="section-header">🔍 Vessel Inspector</div>',
                     unsafe_allow_html=True)
         vessel_ids_sorted = ["— Select a vessel —"] + sorted(df["vessel_id"].tolist())
         selected_vessel   = st.selectbox("Vessel ID", vessel_ids_sorted,
                                          label_visibility="collapsed")
 
-    if (not _REALTIME_MODE) and selected_vessel != "— Select a vessel —":
+    if (not (_REALTIME_MODE or _LIVE_AIS_MODE)) and selected_vessel != "— Select a vessel —":
         row         = df[df["vessel_id"] == selected_vessel].iloc[0]
         risk_colour = _RISK_COLOURS.get(row["risk_level"], "#888")
         risk_result = risk_map[selected_vessel]
@@ -780,7 +814,7 @@ with st.sidebar:
                 </div>""", unsafe_allow_html=True)
 
     st.markdown('<hr style="border-color:#1e2d50;margin:20px 0 12px;">', unsafe_allow_html=True)
-    _footer_region = ("Danish Waters" if _REALTIME_MODE
+    _footer_region = ("Danish Waters" if (_REALTIME_MODE or _LIVE_AIS_MODE)
                       else pipeline_meta.get('region', 'Bay of Bengal'))
     st.markdown(f"""
     <div style="font-size:0.68rem;color:#2a4060;text-align:center;line-height:1.6;">
@@ -950,6 +984,240 @@ if _REALTIME_MODE:
       &nbsp;|&nbsp; Not a live AIS feed · Danish Waters
     </div>
     """, unsafe_allow_html=True)
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Live AIS main view — real AISStream data via the live_ais client.
+# One client instance is kept in session_state and reused across reruns
+# (never a new WebSocket per rerun). Rendering never blocks on the network.
+# ---------------------------------------------------------------------------
+if _LIVE_AIS_MODE:
+    import time as _time
+    import live_ais as _la
+
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:16px;padding:18px 24px;
+                margin-bottom:14px;background:linear-gradient(90deg,#06231a 0%,#080c1a 100%);
+                border-bottom:1px solid #0a5a3a;border-radius:0 0 8px 8px;">
+      <div style="font-size:2.3rem;">🛰️</div>
+      <div>
+        <div style="font-size:1.4rem;font-weight:700;color:#2ECC71;letter-spacing:0.05em;">
+          Live AISStream Monitoring
+        </div>
+        <div style="font-size:0.74rem;color:#5fae82;letter-spacing:0.08em;margin-top:2px;">
+          LIVE AIS DATA · AISSTREAM.IO · SUSPICIOUS-BEHAVIOUR INDICATORS (NOT CONFIRMED ILLEGAL FISHING)
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    _api_key = _la.get_api_key()
+    if not _api_key:
+        st.warning(
+            "**Live AIS is not configured.** Add `AISSTREAM_API_KEY` to your "
+            "environment configuration (a local `.env` file, or Streamlit "
+            "Secrets when deployed) and reload. Simulated, Historical AIS and "
+            "Real-Time Simulation modes work without a key."
+        )
+        st.info("See CLIENT_SETUP_GUIDE.md for step-by-step setup instructions.")
+        st.stop()
+
+    # ── Region selector ──────────────────────────────────────────────────
+    rc1, rc2, rc3 = st.columns([2, 1, 1])
+    with rc1:
+        _region = st.selectbox(
+            "Monitoring region (AISStream subscription box)",
+            options=list(_la.LIVE_AIS_REGIONS.keys()),
+            index=list(_la.LIVE_AIS_REGIONS.keys()).index(_la.DEFAULT_REGION_NAME),
+            key="live_region",
+        )
+    with rc2:
+        _auto = st.checkbox("Auto-refresh", value=True, key="live_auto")
+    with rc3:
+        st.button("🔄 Refresh now", use_container_width=True, key="live_refresh_btn")
+
+    _bbox = _la.get_region_bbox(_region)
+    _center, _zoom = _la.get_region_center_zoom(_region)
+
+    # ── Client lifecycle: one instance per session, restart on region change.
+    _needs_new = (
+        "live_client" not in st.session_state
+        or st.session_state.get("live_region_active") != _region
+    )
+    if _needs_new:
+        old = st.session_state.get("live_client")
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        client = _la.LiveAISClient(bbox=_bbox)
+        client.start()
+        st.session_state["live_client"] = client
+        st.session_state["live_region_active"] = _region
+        try:
+            database.initialize_database(DEFAULT_DB_PATH)
+        except Exception:
+            pass
+    client = st.session_state["live_client"]
+
+    _stats = client.stats()
+
+    # ── Connection status badge ──────────────────────────────────────────
+    _status = _stats["status"]
+    _status_meta = {
+        "connected":    ("● CONNECTED", "#2ECC71"),
+        "connecting":   ("● CONNECTING…", "#FF8C00"),
+        "disconnected": ("● DISCONNECTED", "#8899bb"),
+        "error":        ("● ERROR", "#FF3333"),
+    }.get(_status, ("● UNKNOWN", "#8899bb"))
+    st.markdown(
+        f'<div style="font-size:0.95rem;font-weight:700;color:{_status_meta[1]};">'
+        f'{_status_meta[0]}</div>'
+        f'<div style="font-size:0.72rem;color:#5a7aa5;margin-bottom:8px;">'
+        f'Region: {_region} &nbsp;|&nbsp; box '
+        f'[{_bbox["min_lat"]}, {_bbox["min_lon"]}] → '
+        f'[{_bbox["max_lat"]}, {_bbox["max_lon"]}]</div>',
+        unsafe_allow_html=True,
+    )
+    if _status == "error" and _stats["last_error"]:
+        st.error(f"Connection problem: {_stats['last_error']}  \n"
+                 "The client will keep retrying with backoff. If this persists, "
+                 "verify your API key and that your network allows WebSocket "
+                 "connections to stream.aisstream.io.")
+
+    # ── Compute risk for currently tracked live vessels ──────────────────
+    _active = client.state.get_all_active_vessels()
+    _risk = {}
+    _live_df = None
+    if _active:
+        rows = []
+        for vid, s in _active.items():
+            rows.append({
+                "vessel_id": vid,
+                "latitude":  round(float(s["latitude"]), 4),
+                "longitude": round(float(s["longitude"]), 4),
+                "speed":     float(s.get("speed") or 0.0),
+                "heading":   float(s.get("heading") or 0.0),
+                "behavior":  "AIS Track",
+            })
+        _live_df = pd.DataFrame(rows)
+        _recent = client.state.get_all_recent_tracks()
+        try:
+            _zones_live = get_zones("Historical AIS")
+            _risk = compute_live_risk(_live_df, _recent, _zones_live)
+        except Exception as exc:
+            st.warning(f"Risk processing temporarily unavailable: {exc}")
+            _risk = {}
+
+    _high = sum(1 for r in _risk.values() if r["risk_level"] == "HIGH")
+    _med  = sum(1 for r in _risk.values() if r["risk_level"] == "MEDIUM")
+    _low  = sum(1 for r in _risk.values() if r["risk_level"] == "LOW")
+    _stale = client.state.remove_stale_vessels(_la.LIVE_AIS_STALE_SECONDS)
+
+    # ── Metrics row ──────────────────────────────────────────────────────
+    mcol = st.columns(6)
+    mcol[0].metric("📡 Tracked Vessels", _stats["vessel_count"])
+    mcol[1].metric("📨 Messages", _stats["message_count"])
+    mcol[2].metric("🔴 HIGH", _high)
+    mcol[3].metric("🟠 MEDIUM", _med)
+    mcol[4].metric("🟢 LOW", _low)
+    mcol[5].metric("🧹 Stale dropped", _stale)
+
+    _lm = _stats["last_message_at"]
+    _lu = _stats["last_update_at"]
+    st.caption(
+        f"Last raw message: {_lm if _lm else '—'}  |  "
+        f"Last valid position: {_lu if _lu else '—'}  |  "
+        f"Reconnect attempts: {_stats['reconnect_attempts']}"
+    )
+
+    # ── Empty / waiting states ───────────────────────────────────────────
+    if _status == "connected" and _stats["vessel_count"] == 0:
+        st.info("Connected to AISStream, but no vessel positions have arrived "
+                "in this region yet. Coverage depends on the provider and on "
+                "vessels currently transmitting AIS here — this can be normal.")
+    elif _status in ("connecting",) and _stats["vessel_count"] == 0:
+        st.info("Establishing the live connection… positions will appear as "
+                "they arrive.")
+
+    # ── Map + alerts ─────────────────────────────────────────────────────
+    live_map_col, live_alert_col = st.columns([3, 1], gap="medium")
+    with live_map_col:
+        st.markdown('<div class="section-header">🗺️ Live Vessel Map</div>',
+                    unsafe_allow_html=True)
+        if _live_df is not None and _risk:
+            md = _live_df.copy()
+            md["risk_level"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("risk_level", "LOW"))
+            md["risk_score"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("overall_score", 0))
+            md["zone_status"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("zone_status", "Open Waters"))
+            fmap = build_map(md, zones=get_zones("Historical AIS"),
+                             center=_center, zoom=_zoom)
+            st_folium(fmap, width=None, height=520, returned_objects=[])
+        else:
+            # Still show the region on an empty map so the view is never blank.
+            fmap = build_map(pd.DataFrame(columns=["vessel_id", "latitude", "longitude",
+                                                   "speed", "heading", "behavior",
+                                                   "risk_level", "risk_score", "zone_status"]),
+                             zones=get_zones("Historical AIS"),
+                             center=_center, zoom=_zoom)
+            st_folium(fmap, width=None, height=520, returned_objects=[])
+    with live_alert_col:
+        st.markdown('<div class="section-header">🚨 Live Alerts</div>',
+                    unsafe_allow_html=True)
+        _live_alerts = generate_alerts(_risk) if _risk else []
+        if not _live_alerts:
+            st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No alerts.</p>',
+                        unsafe_allow_html=True)
+        for a in _live_alerts[:10]:
+            css = "alert-high" if a["level"] == "HIGH" else "alert-medium"
+            st.markdown(f"""
+            <div class="{css}">
+              <div style="font-weight:700;font-size:0.8rem;">
+                {a['icon']} {a['vessel']}
+                <span style="font-size:0.62rem;color:#4a6a9a;float:right;">{a['level']}</span>
+              </div>
+              <div style="color:#b0c0d8;font-size:0.74rem;line-height:1.4;">
+                {a['message']}
+              </div>
+            </div>""", unsafe_allow_html=True)
+        # Persist live alerts (non-blocking; failure never breaks the view).
+        if _live_alerts:
+            try:
+                database.insert_alerts(
+                    [{"vessel_id": a["vessel"], "level": a["level"],
+                      "message": a["message"], "reason": a.get("reason", "")}
+                     for a in _live_alerts], DEFAULT_DB_PATH)
+            except Exception:
+                pass
+
+    # ── Vessel table ─────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📋 Live Vessels</div>',
+                unsafe_allow_html=True)
+    if _live_df is not None and _risk:
+        tbl = _live_df[["vessel_id", "latitude", "longitude", "speed", "heading"]].copy()
+        tbl["risk"] = tbl["vessel_id"].map(lambda v: _risk.get(v, {}).get("risk_level", "LOW"))
+        tbl["score"] = tbl["vessel_id"].map(lambda v: _risk.get(v, {}).get("overall_score", 0))
+        tbl.columns = ["MMSI", "Lat", "Lon", "Speed(kn)", "Heading°", "Risk", "Score"]
+        tbl = tbl.sort_values("Score", ascending=False)
+        st.dataframe(tbl, hide_index=True, height=300, width="stretch")
+    else:
+        st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No live vessels yet.</p>',
+                    unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="text-align:center;padding:16px;border-top:1px solid #1e2d50;
+                color:#2a4060;font-size:0.7rem;letter-spacing:0.06em;margin-top:16px;">
+      ILLEGAL FISHING DETECTION SYSTEM · LIVE AISSTREAM DATA
+      &nbsp;|&nbsp; Suspicious-behaviour indicators — not confirmed illegal fishing
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Bounded auto-refresh (no busy loop): sleep one interval then rerun.
+    if st.session_state.get("live_auto"):
+        _time.sleep(max(1, _la.LIVE_AIS_REFRESH_SECONDS))
+        st.rerun()
     st.stop()
 
 

@@ -1,19 +1,26 @@
 # Illegal Fishing Detection System (IFDS)
 
 An AI-assisted maritime vessel-monitoring and suspicious-behaviour detection
-**demonstrator**. IFDS ingests vessel movement data, cleans and validates it,
-derives behavioural indicators from vessel trajectories, applies two
-unsupervised anomaly detectors (Isolation Forest + a temporal sequence
-autoencoder), computes a unified explainable risk score with configurable
-geographic monitoring zones, generates prioritised alerts, persists results to a
-local database, and presents everything in an interactive Streamlit dashboard —
-including a controlled real-time **replay** of historical AIS data.
+system. IFDS ingests vessel movement data, cleans and validates it, derives
+behavioural indicators from vessel trajectories, applies two unsupervised
+anomaly detectors (Isolation Forest + a temporal sequence autoencoder), computes
+a unified explainable risk score with configurable geographic monitoring zones,
+generates prioritised alerts, persists results to a local database, and presents
+everything in an interactive Streamlit dashboard.
+
+It runs in **four data modes** — synthetic *Simulated* data, a *Historical AIS*
+dataset, a controlled *Real-Time Simulation* (replay), and a genuinely **Live
+AIS** mode that connects to the **AISStream.io** WebSocket API for real,
+configurable India-focused coastal monitoring.
 
 > **Honest scope.** This is a prototype / final-year-project demonstrator. It
-> identifies **anomalous and suspicious movement behaviour**. It does **not**
-> prove illegal fishing, is **not** connected to a live AIS feed, and makes **no**
-> accuracy/precision/recall claims because there is no labelled illegal-fishing
-> ground truth. See the Disclaimer at the end.
+> identifies **anomalous and suspicious movement behaviour** and produces risk
+> *indicators* — it does **not** prove illegal fishing and makes **no**
+> accuracy/precision/recall claims (there is no labelled illegal-fishing ground
+> truth). The Live AIS mode uses a real third-party feed whose coverage is not
+> guaranteed; the other three modes use historical/synthetic data. Monitoring
+> zones shown on the map are **demonstration zones**, not official legal
+> boundaries. See the Disclaimer at the end.
 
 ---
 
@@ -43,14 +50,16 @@ It does not make enforcement decisions and does not label vessels as criminal.
 - Local SQLite persistence (history sink)
 - Interactive dark maritime dashboard (map, metrics, inspector, history)
 - Controlled **AIS replay simulation** mode with live metrics and dedup alerts
-- Three data modes: Simulated · Historical AIS · Real-Time (Replay) Simulation
+- **Live AIS** mode via the AISStream.io WebSocket API (real feed, India-focused
+  configurable regions, secure environment/Secrets key handling, auto-reconnect)
+- Four data modes: Simulated · Historical AIS · Real-Time Simulation · Live AIS
 
 ---
 
 ## Architecture
 
 ```text
-                 Data source (Simulated | Historical AIS | Replay)
+          Data source (Simulated | Historical AIS | Replay | Live AISStream)
                                    |
                            AIS ingestion (ais_loader)
                                    |
@@ -109,8 +118,46 @@ A controlled, deterministic **replay** of the cleaned historical AIS data,
 emitted tick-by-tick with live metrics and alerts. **It is not a live AIS feed**
 and does not receive vessels in real time.
 
-> The project does not provide live AIS, real-time satellite data, or production
-> maritime surveillance. Ingestion is from historical/local data only.
+### Live AIS (AISStream.io)
+
+A genuinely live mode that connects to the **AISStream.io** WebSocket API,
+subscribes to a configurable India-focused coastal region, receives real AIS
+position reports, normalises and validates them, and feeds them through the
+**same** detection pipeline (geofencing → behaviour → Isolation Forest →
+temporal → unified risk → alerts). Requires an `AISSTREAM_API_KEY`
+(see "Live AIS Mode" below and `CLIENT_SETUP_GUIDE.md`). Coverage depends on the
+external provider; "connected with no vessels" is a legitimate state. Output is
+a suspicious-behaviour risk indicator, **not** confirmed illegal fishing. With
+no key configured, Live AIS shows setup guidance and the other three modes keep
+working.
+
+> Simulated, Historical AIS, and Real-Time Simulation modes do not use any live
+> feed. Only **Live AIS** connects to an external provider, and only when an API
+> key is configured.
+
+---
+
+## Live AIS Mode
+
+**Configure the API key (no code editing required):**
+
+- **Locally:** copy `.env.example` to `.env`, then set
+  `AISSTREAM_API_KEY=your_key` in `.env` (git-ignored).
+- **Streamlit Cloud:** add `AISSTREAM_API_KEY = "your_key"` under the app's
+  **Settings → Secrets**.
+
+Key precedence: environment variable (`.env`/shell) first, then Streamlit
+Secrets. The placeholder value counts as "not configured". The key is never
+printed, logged, shown in the UI, stored in the database, or committed.
+
+**Monitoring regions** are selectable in the Live AIS view (Tamil Nadu /
+Coromandel Coast — default, Bay of Bengal (India East), Andhra Pradesh, Kerala,
+Karnataka, Gujarat, Maharashtra/Goa, plus the Danish historical region). These
+are **demonstration monitoring regions**, not official maritime boundaries.
+
+**Run:** `python -m streamlit run app.py` → sidebar **Data Source** → **Live
+AIS** → pick a region. Full step-by-step local + cloud + troubleshooting
+instructions are in **`CLIENT_SETUP_GUIDE.md`**.
 
 ---
 
@@ -272,6 +319,7 @@ illegal-fishing-detection/
 ├── temporal_model_manager.py   # Temporal model persistent lifecycle (joblib)
 ├── risk_engine.py              # Unified risk scoring + alert generation
 ├── realtime_simulator.py       # AIS replay simulation (tick-driven)
+├── live_ais.py                 # Live AISStream WebSocket client + vessel state
 ├── alert_engine.py             # Alert triggering with dedup/cooldown
 ├── map_builder.py              # Folium map construction
 ├── database.py                 # SQLite persistence (history sink)
