@@ -19,6 +19,7 @@ from live_ais import (
     get_api_key, build_subscription_message, normalize_message,
     VesselStateManager, LiveAISClient, LIVE_AIS_BBOX, LIVE_AIS_REGIONS,
     get_region_bbox, get_region_center_zoom, DEFAULT_REGION_NAME,
+    normalize_static, ship_type_label, decode_ship_type,
 )
 
 
@@ -76,7 +77,8 @@ def test_subscription_message_shape():
     box = sub["BoundingBoxes"][0]
     assert box == [[LIVE_AIS_BBOX["min_lat"], LIVE_AIS_BBOX["min_lon"]],
                    [LIVE_AIS_BBOX["max_lat"], LIVE_AIS_BBOX["max_lon"]]]
-    assert sub["FilterMessageTypes"] == ["PositionReport"]
+    # Now subscribes to both movement and static (type/name/dest/ETA) messages.
+    assert sub["FilterMessageTypes"] == ["PositionReport", "ShipStaticData"]
     print("subscription message shape  OK")
 
 
@@ -188,7 +190,8 @@ def test_state_remove_stale():
 
 def test_regions_valid_and_india_default():
     assert DEFAULT_REGION_NAME in LIVE_AIS_REGIONS
-    assert "Tamil Nadu" in DEFAULT_REGION_NAME
+    assert "India" in DEFAULT_REGION_NAME  # default is the widest India box
+    assert "Tamil Nadu / Coromandel Coast" in LIVE_AIS_REGIONS
     for name, r in LIVE_AIS_REGIONS.items():
         assert -90 <= r["min_lat"] < r["max_lat"] <= 90, name
         assert -180 <= r["min_lon"] < r["max_lon"] <= 180, name
@@ -196,7 +199,7 @@ def test_regions_valid_and_india_default():
     assert set(box) == {"min_lat", "min_lon", "max_lat", "max_lon"}
     center, zoom = get_region_center_zoom(DEFAULT_REGION_NAME)
     assert len(center) == 2 and isinstance(zoom, int)
-    print("india regions valid + default is Tamil Nadu  OK")
+    print("india regions valid + default is widest India box  OK")
 
 
 # ---------------------------------------------------------------------------
@@ -318,3 +321,64 @@ if __name__ == "__main__":
     for t in tests:
         t(); p += 1
     print(f"\n=== {p}/{len(tests)} TESTS PASSED ===")
+
+# ---------------------------------------------------------------------------
+# Ship static data (type / name / destination / ETA) + first-seen proxy
+# ---------------------------------------------------------------------------
+
+def test_ship_type_labels():
+    assert ship_type_label(30) == "Fishing"
+    assert ship_type_label(37) == "Pleasure Craft"
+    assert decode_ship_type(70) == "Cargo"
+    assert decode_ship_type(80) == "Tanker"
+    assert decode_ship_type(0) == "Unknown"
+    assert decode_ship_type(None) == "Unknown"
+    print("ship type labels  OK")
+
+
+def _static_msg(mmsi=123456789, name="SEA EXPLORER", stype=70,
+                dest="CHENNAI", month=3, day=15, hour=8, minute=30):
+    return {
+        "MessageType": "ShipStaticData",
+        "MetaData": {"MMSI": mmsi},
+        "Message": {"ShipStaticData": {
+            "UserID": mmsi, "Name": name, "Type": stype,
+            "Destination": dest, "MaximumStaticDraught": 7.5,
+            "Eta": {"Month": month, "Day": day, "Hour": hour, "Minute": minute},
+        }},
+    }
+
+
+def test_normalize_static_basic():
+    out = normalize_static(_static_msg())
+    assert out["vessel_id"] == "123456789"
+    assert out["ship_name"] == "SEA EXPLORER"
+    assert out["ship_type"] == "Cargo"
+    assert out["destination"] == "CHENNAI"
+    assert out["eta"] == "03-15 08:30 UTC"
+    assert out["draught"] == 7.5
+    # Non-static messages are ignored
+    assert normalize_static({"MessageType": "PositionReport"}) is None
+    print("normalize static basic  OK")
+
+
+def test_static_merges_into_state_without_clobbering():
+    vsm = VesselStateManager()
+    vsm.update_vessel({
+        "vessel_id": "555", "latitude": 10.0, "longitude": 80.0,
+        "speed": 5.0, "heading": 90.0, "course": 90.0,
+        "timestamp": datetime(2025, 1, 1, tzinfo=timezone.utc),
+    })
+    vsm.update_static(normalize_static(_static_msg(mmsi=555, name="FISHER I",
+                                                   stype=30, dest="KOCHI")))
+    s = vsm.get_vessel_state("555")
+    assert s["ship_name"] == "FISHER I"
+    assert s["ship_type"] == "Fishing"
+    assert s["destination"] == "KOCHI"
+    # first-seen proxy recorded on the first position
+    assert s["first_seen_lat"] == 10.0 and s["first_seen_lon"] == 80.0
+    assert s["first_seen_time"] == datetime(2025, 1, 1, tzinfo=timezone.utc)
+    # An empty static update must not wipe a known name
+    vsm.update_static({"vessel_id": "555", "ship_name": "", "ship_type": "Unknown"})
+    assert vsm.get_vessel_state("555")["ship_name"] == "FISHER I"
+    print("static merges into state without clobbering  OK")

@@ -1093,6 +1093,7 @@ if _LIVE_AIS_MODE:
     _live_df = None
     if _active:
         rows = []
+        _meta_rows = {}
         for vid, s in _active.items():
             rows.append({
                 "vessel_id": vid,
@@ -1102,6 +1103,16 @@ if _LIVE_AIS_MODE:
                 "heading":   float(s.get("heading") or 0.0),
                 "behavior":  "AIS Track",
             })
+            _fs_t = s.get("first_seen_time")
+            _meta_rows[vid] = {
+                "ship_name":   s.get("ship_name") or "—",
+                "ship_type":   s.get("ship_type") or "Unknown",
+                "destination": s.get("destination") or "—",
+                "eta":         s.get("eta") or "—",
+                "first_seen":  (str(_fs_t)[:19].replace("T", " ") if _fs_t else "—"),
+                "first_lat":   s.get("first_seen_lat"),
+                "first_lon":   s.get("first_seen_lon"),
+            }
         _live_df = pd.DataFrame(rows)
         _recent = client.state.get_all_recent_tracks()
         try:
@@ -1116,14 +1127,24 @@ if _LIVE_AIS_MODE:
     _low  = sum(1 for r in _risk.values() if r["risk_level"] == "LOW")
     _stale = client.state.remove_stale_vessels(_la.LIVE_AIS_STALE_SECONDS)
 
-    # ── Metrics row ──────────────────────────────────────────────────────
+    # ── Metrics row (live only — every number here reflects the current
+    #    live feed and updates each refresh; no stale batch metrics shown). ──
+    _live_alert_count = _high + _med
     mcol = st.columns(6)
-    mcol[0].metric("📡 Tracked Vessels", _stats["vessel_count"])
-    mcol[1].metric("📨 Messages", _stats["message_count"])
-    mcol[2].metric("🔴 HIGH", _high)
-    mcol[3].metric("🟠 MEDIUM", _med)
-    mcol[4].metric("🟢 LOW", _low)
-    mcol[5].metric("🧹 Stale dropped", _stale)
+    mcol[0].metric("📡 Tracked Vessels", _stats["vessel_count"],
+                   help="Vessels currently transmitting AIS in this region window.")
+    mcol[1].metric("📨 Messages", _stats["message_count"],
+                   help="Total AIS messages received this session.")
+    mcol[2].metric("🔴 HIGH", _high,
+                   help="Vessels whose live behaviour scored HIGH risk right now.")
+    mcol[3].metric("🟠 MEDIUM", _med,
+                   help="Vessels scored MEDIUM risk right now.")
+    mcol[4].metric("🚨 Active Alerts", _live_alert_count,
+                   help="HIGH + MEDIUM vessels needing attention right now. "
+                        "0 is normal when traffic is light or all vessels "
+                        "look routine.")
+    mcol[5].metric("🧹 Stale dropped", _stale,
+                   help="Vessels dropped this refresh after going silent.")
 
     _lm = _stats["last_message_at"]
     _lu = _stats["last_update_at"]
@@ -1135,9 +1156,16 @@ if _LIVE_AIS_MODE:
 
     # ── Empty / waiting states ───────────────────────────────────────────
     if _status == "connected" and _stats["vessel_count"] == 0:
-        st.info("Connected to AISStream, but no vessel positions have arrived "
-                "in this region yet. Coverage depends on the provider and on "
-                "vessels currently transmitting AIS here — this can be normal.")
+        st.info(
+            "Connected to AISStream, but no vessel positions have arrived in "
+            "this region yet. AISStream is a free, crowd-sourced feed, so "
+            "coverage over Indian coastal waters can be sparse or intermittent "
+            "— an empty result here does not mean the system is broken. "
+            "Tip: try the **\u201cIndia (All Coasts — widest coverage)\u201d** "
+            "region for the best chance of traffic, keep Auto-refresh on, and "
+            "give it 30–60 seconds. Busy regions (e.g. European/Danish waters) "
+            "will show vessels immediately for a demo."
+        )
     elif _status in ("connecting",) and _stats["vessel_count"] == 0:
         st.info("Establishing the live connection… positions will appear as "
                 "they arrive.")
@@ -1197,11 +1225,27 @@ if _LIVE_AIS_MODE:
                 unsafe_allow_html=True)
     if _live_df is not None and _risk:
         tbl = _live_df[["vessel_id", "latitude", "longitude", "speed", "heading"]].copy()
+        tbl["name"] = tbl["vessel_id"].map(lambda v: _meta_rows.get(v, {}).get("ship_name", "—"))
+        tbl["type"] = tbl["vessel_id"].map(lambda v: _meta_rows.get(v, {}).get("ship_type", "Unknown"))
+        tbl["dest"] = tbl["vessel_id"].map(lambda v: _meta_rows.get(v, {}).get("destination", "—"))
+        tbl["eta"]  = tbl["vessel_id"].map(lambda v: _meta_rows.get(v, {}).get("eta", "—"))
+        tbl["first_seen"] = tbl["vessel_id"].map(lambda v: _meta_rows.get(v, {}).get("first_seen", "—"))
         tbl["risk"] = tbl["vessel_id"].map(lambda v: _risk.get(v, {}).get("risk_level", "LOW"))
         tbl["score"] = tbl["vessel_id"].map(lambda v: _risk.get(v, {}).get("overall_score", 0))
-        tbl.columns = ["MMSI", "Lat", "Lon", "Speed(kn)", "Heading°", "Risk", "Score"]
+        tbl = tbl[["vessel_id", "name", "type", "speed", "heading",
+                   "latitude", "longitude", "dest", "eta", "first_seen",
+                   "risk", "score"]]
+        tbl.columns = ["MMSI", "Name", "Type", "Speed(kn)", "Heading°",
+                       "Lat", "Lon", "Destination", "ETA (UTC)",
+                       "First seen (monitor)", "Risk", "Score"]
         tbl = tbl.sort_values("Score", ascending=False)
-        st.dataframe(tbl, hide_index=True, height=300, width="stretch")
+        st.dataframe(tbl, hide_index=True, height=320, width="stretch")
+        st.caption(
+            "Name / Type / Destination / ETA come from AIS static reports "
+            "(vessel-reported, may be blank or stale). AIS has no departure "
+            "field — \u201cFirst seen (monitor)\u201d is when the vessel first "
+            "appeared in this live window, not an official departure time."
+        )
     else:
         st.markdown('<p style="color:#4a6a9a;font-size:0.82rem;">No live vessels yet.</p>',
                     unsafe_allow_html=True)

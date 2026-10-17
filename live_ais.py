@@ -107,6 +107,10 @@ _MAX_BACKOFF_SECONDS = 60.0
 # chosen to cover the stated coastal stretch; verify before operational use.
 # ---------------------------------------------------------------------------
 LIVE_AIS_REGIONS: Dict[str, Dict] = {
+    "India (All Coasts — widest coverage)": {
+        "min_lat": 6.0, "min_lon": 66.0, "max_lat": 24.0, "max_lon": 93.0,
+        "center": (15.0, 80.0), "zoom": 4,
+    },
     "Tamil Nadu / Coromandel Coast": {
         "min_lat": 8.0, "min_lon": 78.0, "max_lat": 13.5, "max_lon": 82.0,
         "center": (10.8, 80.0), "zoom": 7,
@@ -141,7 +145,7 @@ LIVE_AIS_REGIONS: Dict[str, Dict] = {
     },
 }
 
-DEFAULT_REGION_NAME = "Tamil Nadu / Coromandel Coast"
+DEFAULT_REGION_NAME = "India (All Coasts — widest coverage)"
 
 
 def get_region_bbox(region_name: str) -> Dict[str, float]:
@@ -170,7 +174,134 @@ def build_subscription_message(api_key: str, bbox: Dict[str, float]) -> dict:
             [bbox["min_lat"], bbox["min_lon"]],
             [bbox["max_lat"], bbox["max_lon"]],
         ]],
-        "FilterMessageTypes": ["PositionReport"],
+        # PositionReport gives us live movement; ShipStaticData (AIS msg type 5)
+        # gives us vessel type, name, destination and ETA so the dashboard can
+        # show "vessel details", not just coordinates.
+        "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# AIS ship-type decoding (ITU-R M.1371 "Type of ship and cargo" first digit).
+# AIS has NO "departure time/location" field — it carries DESTINATION + ETA in
+# the static/voyage message (type 5). We expose those honestly and add a
+# monitor-side "first seen" time/position as a practical proxy for when the
+# vessel entered our live monitoring window.
+# ---------------------------------------------------------------------------
+
+def decode_ship_type(code) -> str:
+    """Map an AIS ship-type code (0-99) to a human-readable category.
+
+    Only the first digit (the broad category) is interpreted; the second digit
+    refines cargo/hazard and is not needed for a readable label. Returns
+    "Unknown" when the code is missing or 0.
+    """
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if c <= 0:
+        return "Unknown"
+    tens = c // 10
+    specific = {
+        50: "Pilot Vessel", 51: "Search & Rescue", 52: "Tug",
+        53: "Port Tender", 54: "Anti-pollution", 55: "Law Enforcement",
+        58: "Medical Transport", 59: "Non-combatant Ship",
+    }
+    if c in specific:
+        return specific[c]
+    return {
+        2: "Wing-in-Ground",
+        3: "Fishing / Special",  # 30 = Fishing; refined below
+        4: "High-Speed Craft",
+        6: "Passenger",
+        7: "Cargo",
+        8: "Tanker",
+        9: "Other",
+    }.get(tens, "Other")
+
+
+def ship_type_label(code) -> str:
+    """Readable ship-type label with the fishing case called out explicitly."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return "Unknown"
+    if c == 30:
+        return "Fishing"
+    if 31 <= c <= 32:
+        return "Towing"
+    if c == 33:
+        return "Dredging"
+    if c == 34:
+        return "Diving Ops"
+    if c == 35:
+        return "Military Ops"
+    if c == 36:
+        return "Sailing"
+    if c == 37:
+        return "Pleasure Craft"
+    return decode_ship_type(code)
+
+
+def _decode_eta(msg: dict) -> Optional[str]:
+    """Build a readable ETA string from AISStream ShipStaticData ETA fields.
+
+    AIS ETA is month/day/hour/minute (no year). Returns None when unset
+    (month 0 means "not available"). This is the vessel-reported ETA, not a
+    guaranteed arrival.
+    """
+    eta = msg.get("Eta") or msg.get("ETA") or {}
+    if not isinstance(eta, dict):
+        return None
+    mo = eta.get("Month", 0) or 0
+    day = eta.get("Day", 0) or 0
+    hr = eta.get("Hour", 24)
+    mn = eta.get("Minute", 60)
+    if not mo or not day:
+        return None
+    hr = 0 if hr in (24, None) else hr
+    mn = 0 if mn in (60, None) else mn
+    try:
+        return f"{int(mo):02d}-{int(day):02d} {int(hr):02d}:{int(mn):02d} UTC"
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_static(raw: dict) -> Optional[Dict]:
+    """Normalize one AISStream ShipStaticData message into vessel metadata.
+
+    Returns None for non-static messages or when the vessel id is missing.
+    Values are vessel-reported and may be stale, blank, or inaccurate.
+    """
+    if not isinstance(raw, dict) or raw.get("MessageType") != "ShipStaticData":
+        return None
+    meta = raw.get("MetaData", {}) or {}
+    sd = raw.get("Message", {}).get("ShipStaticData", {}) or {}
+    mmsi = meta.get("MMSI", sd.get("UserID"))
+    if mmsi is None:
+        return None
+    try:
+        vessel_id = str(int(mmsi))
+    except (TypeError, ValueError):
+        vessel_id = str(mmsi).strip()
+    if not vessel_id or vessel_id.lower() == "none":
+        return None
+
+    name = (sd.get("Name") or meta.get("ShipName") or "").strip()
+    dest = (sd.get("Destination") or "").strip()
+    try:
+        draught = float(sd.get("MaximumStaticDraught")) or None
+    except (TypeError, ValueError):
+        draught = None
+
+    return {
+        "vessel_id":   vessel_id,
+        "ship_name":   name or None,
+        "ship_type":   ship_type_label(sd.get("Type")),
+        "destination": dest or None,
+        "eta":         _decode_eta(sd),
+        "draught":     draught,
     }
 
 
@@ -271,6 +402,7 @@ class VesselStateManager:
         self._max_points = max_trajectory_points
         self._state: Dict[str, Dict] = {}
         self._tracks: Dict[str, Deque[Dict]] = {}
+        self._static: Dict[str, Dict] = {}  # vessel metadata (type/name/dest/eta)
         self.message_count = 0
 
     def update_vessel(self, obs: Dict) -> None:
@@ -279,6 +411,9 @@ class VesselStateManager:
         vid = obs["vessel_id"]
         with self._lock:
             prev = self._state.get(vid)
+            # "first_seen_*" = when/where this vessel first entered OUR live
+            # monitoring window. AIS has no departure field; this is an honest
+            # monitor-side proxy, labelled as such in the UI.
             self._state[vid] = {
                 "vessel_id":        vid,
                 "latitude":         obs["latitude"],
@@ -293,6 +428,9 @@ class VesselStateManager:
                 "prev_heading":     prev["heading"] if prev else None,
                 "last_ais_timestamp": obs["timestamp"],
                 "message_count":    (prev["message_count"] + 1) if prev else 1,
+                "first_seen_time":  prev["first_seen_time"] if prev else obs["timestamp"],
+                "first_seen_lat":   prev["first_seen_lat"] if prev else obs["latitude"],
+                "first_seen_lon":   prev["first_seen_lon"] if prev else obs["longitude"],
             }
             dq = self._tracks.setdefault(vid, deque(maxlen=self._max_points))
             dq.append({
@@ -304,14 +442,42 @@ class VesselStateManager:
             })
             self.message_count += 1
 
+    def update_static(self, meta: Dict) -> None:
+        """Store/merge vessel static metadata (type, name, destination, ETA).
+
+        Non-empty values overwrite; empty values never clobber a known value.
+        """
+        vid = meta.get("vessel_id")
+        if not vid:
+            return
+        with self._lock:
+            cur = self._static.get(vid, {})
+            for k in ("ship_name", "ship_type", "destination", "eta", "draught"):
+                v = meta.get(k)
+                if v not in (None, "", "Unknown"):
+                    cur[k] = v
+            cur.setdefault("ship_type", meta.get("ship_type", "Unknown"))
+            self._static[vid] = cur
+
+    def _with_static(self, vid: str, s: Dict) -> Dict:
+        """Return a copy of state merged with any known static metadata."""
+        out = dict(s)
+        meta = self._static.get(vid, {})
+        out["ship_name"]   = meta.get("ship_name")
+        out["ship_type"]   = meta.get("ship_type", "Unknown")
+        out["destination"] = meta.get("destination")
+        out["eta"]         = meta.get("eta")
+        out["draught"]     = meta.get("draught")
+        return out
+
     def get_vessel_state(self, vessel_id: str) -> Optional[Dict]:
         with self._lock:
             s = self._state.get(str(vessel_id))
-            return dict(s) if s else None
+            return self._with_static(str(vessel_id), s) if s else None
 
     def get_all_active_vessels(self) -> Dict[str, Dict]:
         with self._lock:
-            return {vid: dict(s) for vid, s in self._state.items()}
+            return {vid: self._with_static(vid, s) for vid, s in self._state.items()}
 
     def get_recent_track(self, vessel_id: str):
         import pandas as pd
@@ -344,6 +510,7 @@ class VesselStateManager:
             for vid in stale_ids:
                 self._state.pop(vid, None)
                 self._tracks.pop(vid, None)
+                self._static.pop(vid, None)
                 removed += 1
         return removed
 
@@ -441,6 +608,12 @@ class LiveAISClient:
                                               "AIS streaming provider. Please "
                                               "verify the configured API key.")
                             return
+                        mtype = msg.get("MessageType")
+                        if mtype == "ShipStaticData":
+                            stat = normalize_static(msg)
+                            if stat is not None:
+                                self.state.update_static(stat)
+                            continue
                         obs = normalize_message(msg)
                         if obs is not None:
                             self.state.update_vessel(obs)
