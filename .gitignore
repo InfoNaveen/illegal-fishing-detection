@@ -52,6 +52,11 @@ data/ifds.db
 *.db
 *.sqlite
 *.sqlite3
+# WAL mode sidecar files
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 
 # Persistent ML model artifacts (runtime-generated — not committed)
 models/

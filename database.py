@@ -64,12 +64,19 @@ def get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     parent = os.path.dirname(os.path.abspath(db_path))
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    # timeout: wait (not fail) when another connection holds a write lock.
+    # In Live AIS mode a background thread and the Streamlit thread can both
+    # write; without this they would raise "database is locked".
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        # WAL lets readers and a writer proceed concurrently — the right mode
+        # for a dashboard reading history while the pipeline writes it.
+        conn.execute("PRAGMA journal_mode = WAL;")
     except sqlite3.Error:
-        pass  # non-fatal
+        pass  # non-fatal — PRAGMAs are best-effort tuning, not correctness
     return conn
 
 

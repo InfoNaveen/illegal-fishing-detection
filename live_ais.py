@@ -499,13 +499,10 @@ class VesselStateManager:
         with self._lock:
             stale_ids = []
             for vid, s in self._state.items():
-                ts = s.get("timestamp")
-                try:
-                    age = (now - ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None
-                           else now - ts).total_seconds()
-                except Exception:
-                    age = 0
-                if age > stale_seconds:
+                age = self._age_seconds(s.get("timestamp"), now)
+                # age is None when the timestamp is unusable — never drop a
+                # vessel on a parsing error (fail safe, keep it visible).
+                if age is not None and age > stale_seconds:
                     stale_ids.append(vid)
             for vid in stale_ids:
                 self._state.pop(vid, None)
@@ -513,6 +510,24 @@ class VesselStateManager:
                 self._static.pop(vid, None)
                 removed += 1
         return removed
+
+    @staticmethod
+    def _age_seconds(ts, now: datetime) -> Optional[float]:
+        """Seconds between a stored timestamp and ``now`` (both treated as UTC).
+
+        Returns None if ``ts`` is missing or cannot be interpreted, so callers
+        can fail safe instead of dropping a vessel on a parsing error. Handles
+        both naive and tz-aware datetimes/pandas Timestamps.
+        """
+        if ts is None:
+            return None
+        try:
+            # pandas.Timestamp and datetime both expose tzinfo / replace().
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (now - ts).total_seconds()
+        except Exception:
+            return None
 
     def vessel_count(self) -> int:
         with self._lock:

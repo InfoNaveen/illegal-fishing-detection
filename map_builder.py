@@ -4,12 +4,23 @@ Builds the Folium interactive map for the
 Illegal Fishing Detection System prototype (Round 1).
 """
 
+import html
 import folium
 from folium import plugins
 import pandas as pd
 from typing import List, Dict, Tuple
 
 from data_generator import generate_trajectory, get_restricted_zones
+
+
+def _esc(value) -> str:
+    """HTML-escape any value before embedding it in popup/tooltip markup.
+
+    Vessel-supplied fields (id, behaviour, zone/name) can originate from an
+    untrusted live AIS feed. Escaping here prevents HTML/script injection into
+    the Folium map (stored-XSS defence), regardless of what the caller passes.
+    """
+    return html.escape(str(value), quote=True)
 
 # ---------------------------------------------------------------------------
 # Colour / style helpers
@@ -87,7 +98,7 @@ def _add_restricted_zones(fmap: folium.Map,
             fill_opacity=0.18,
             tooltip=zone["name"],
             popup=folium.Popup(
-                f'<b style="color:{zone["color"]}">{zone["name"]}</b><br>'
+                f'<b style="color:{zone["color"]}">{_esc(zone["name"])}</b><br>'
                 f'<span style="font-size:12px;">⚠️ Fishing Prohibited</span>',
                 max_width=200,
             ),
@@ -108,7 +119,7 @@ def _add_restricted_zones(fmap: folium.Map,
                     f'white-space:nowrap;'
                     f'border:1px solid {zone["color"]};'
                     f'">'
-                    f'⛔ {zone["name"]}'
+                    f'⛔ {_esc(zone["name"])}'
                     f'</div>'
                 ),
                 icon_size=(160, 28),
@@ -143,7 +154,7 @@ def _add_vessel_trails(fmap: folium.Map,
             weight=1.8,
             opacity=0.55,
             dash_array="6 4",
-            tooltip=f'{row["vessel_id"]} trail',
+            tooltip=f'{_esc(row["vessel_id"])} trail',
         ).add_to(trail_group)
 
     trail_group.add_to(fmap)
@@ -193,23 +204,23 @@ def _vessel_popup_html(row: pd.Series) -> str:
     <div style="font-family:monospace;min-width:210px;background:#1a1a2e;
                 color:#e0e0e0;padding:10px;border-radius:6px;
                 border-left:4px solid {risk_colour};">
-      <b style="font-size:14px;color:#00d4ff;">⚓ {row['vessel_id']}</b><br><br>
+      <b style="font-size:14px;color:#00d4ff;">⚓ {_esc(row['vessel_id'])}</b><br><br>
       <table style="width:100%;font-size:12px;border-collapse:collapse;">
         <tr><td style="color:#aaa;">Speed</td>
-            <td style="color:#fff;text-align:right;"><b>{row['speed']} kn</b></td></tr>
+            <td style="color:#fff;text-align:right;"><b>{_esc(row['speed'])} kn</b></td></tr>
         <tr><td style="color:#aaa;">Heading</td>
-            <td style="color:#fff;text-align:right;"><b>{row['heading']}°</b></td></tr>
+            <td style="color:#fff;text-align:right;"><b>{_esc(row['heading'])}°</b></td></tr>
         <tr><td style="color:#aaa;">Risk Score</td>
             <td style="color:{risk_colour};text-align:right;">
-                <b>{row['risk_score']}/100</b></td></tr>
+                <b>{_esc(row['risk_score'])}/100</b></td></tr>
         <tr><td style="color:#aaa;">Risk Level</td>
             <td style="text-align:right;">{_risk_badge(row['risk_level'])}</td></tr>
         <tr><td style="color:#aaa;">Behavior</td>
             <td style="color:#fff;text-align:right;font-size:11px;">
-                <b>{row['behavior']}</b></td></tr>
+                <b>{_esc(row['behavior'])}</b></td></tr>
         <tr><td style="color:#aaa;">Zone</td>
             <td style="color:#ffd700;text-align:right;font-size:11px;">
-                <b>{row['zone_status']}</b></td></tr>
+                <b>{_esc(row['zone_status'])}</b></td></tr>
       </table>
     </div>
     """
@@ -251,7 +262,7 @@ def _add_vessel_markers(fmap: folium.Map,
             fill_opacity=0.85,
             weight=3 if is_selected else 1.5,
             tooltip=folium.Tooltip(
-                f"<b>{vid}</b> | {risk} RISK | {row['speed']} kn",
+                f"<b>{_esc(vid)}</b> | {_esc(risk)} RISK | {_esc(row['speed'])} kn",
                 style="background:#1a1a2e;color:#00d4ff;border:1px solid #00d4ff;"
                       "padding:4px 8px;border-radius:4px;font-family:monospace;",
             ),
@@ -270,7 +281,7 @@ def _add_vessel_markers(fmap: folium.Map,
                     f'font-family:monospace;'
                     f'text-shadow:0 0 4px #000,0 0 4px #000;'
                     f'white-space:nowrap;">'
-                    f'{vid}'
+                    f'{_esc(vid)}'
                     f'</div>'
                 ),
                 icon_size=(50, 14),
