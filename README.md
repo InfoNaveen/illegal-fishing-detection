@@ -1,5 +1,7 @@
 <div align="center">
 
+![IFDS Maritime Surveillance Animation](assets/hero.gif)
+
 # 🛰️ Illegal Fishing Detection System (IFDS)
 
 **AI-assisted maritime vessel-monitoring and suspicious-behaviour detection.**
@@ -10,10 +12,10 @@ explainable risk score → raises prioritised alerts → persists results → an
 presents it all in an interactive Streamlit dashboard.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.53-FF4B4B?logo=streamlit&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.54-FF4B4B?logo=streamlit&logoColor=white)
 ![scikit-learn](https://img.shields.io/badge/scikit--learn-1.8-F7931E?logo=scikitlearn&logoColor=white)
 ![Live AIS](https://img.shields.io/badge/Live%20AIS-AISStream.io-00B2A9)
-![Tests](https://img.shields.io/badge/tests-105%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-113%20passing-brightgreen)
 
 </div>
 
