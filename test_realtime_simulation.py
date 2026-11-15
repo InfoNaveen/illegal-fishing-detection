@@ -19,6 +19,7 @@ import pandas as pd
 from realtime_simulator import AISReplaySimulator
 from alert_engine import AlertEngine
 import database
+from database import close_thread_connection
 
 
 def _clean_df(n_vessels=4, per=8):
@@ -154,7 +155,7 @@ def test_alert_db_persistence():
         assert recent and recent[0]["vessel_id"] == "V1"
         print(f"alert DB persistence  OK ({n} alerts)")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------

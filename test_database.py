@@ -19,7 +19,7 @@ import database
 from database import (
     initialize_database, get_connection, persist_pipeline_run,
     get_history_summary, get_recent_alerts, get_recent_risk, get_vessel_recent,
-    DatabaseError,
+    DatabaseError, close_thread_connection,
 )
 
 
@@ -69,7 +69,7 @@ def test_1_2_init_and_tables():
             assert t in names, f"missing table {t}"
         print("1+2. init + all tables exist  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def test_11_init_twice_safe():
         assert summary["total_vessels"] == 2, "init twice must not delete data"
         print("11. init twice safe, data retained  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_3_vessel_upsert():
         assert get_history_summary(db)["total_vessels"] == 2, "vessels must not duplicate"
         print("3. vessel upsert (no duplicates)  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ def test_4_5_positions_dedup():
         assert after_second == 2, "duplicate positions must be ignored"
         print("4+5. positions insert + dedup  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ def test_6_7_8_9_persistence():
             conn.close()
         print("6-9. feature/anomaly/risk/alert persistence  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ def test_10_recent_history():
         assert len(vh["alerts"]) == 1
         print("10. recent history queries  OK")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +245,7 @@ def test_13_simulated_pipeline_persist_end_to_end():
         assert get_history_summary(db)["total_vessels"] == 18
         print(f"13. simulated end-to-end persist  OK ({counts})")
     finally:
-        os.remove(db)
+        close_thread_connection(db); os.remove(db)
 
 
 if __name__ == "__main__":

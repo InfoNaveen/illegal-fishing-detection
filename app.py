@@ -43,6 +43,13 @@ from ais_loader import (
 # ── Round 3 M2: AIS cleaning + regional zone configuration ──────────────────
 from data_processing import clean_ais_dataframe
 from zones import get_zones, get_region_meta
+from live_risk_cache import compute_live_risk  # noqa: E402  (imported here, not inline)
+
+
+@st.cache_data(ttl=3600)
+def _cached_get_zones(source: str):
+    """Cached wrapper around get_zones. Zone definitions don't change at runtime."""
+    return get_zones(source)
 # ── Round 3 M3: SQLite persistence (history sink — never a hard dependency) ──
 import database
 from database import DatabaseError, DEFAULT_DB_PATH
@@ -53,7 +60,6 @@ from temporal_model_manager import run_temporal_detection
 # ── Round 3 M8: real-time AIS replay simulation + alerts ────────────────────
 from realtime_simulator import AISReplaySimulator, DEFAULT_TICKS
 from alert_engine import AlertEngine, DEFAULT_COOLDOWN_TICKS
-from zones import get_zones as _get_zones_rt
 # ── Live AIS integration (AISStream.io) ─────────────────────────────────────
 import live_ais
 from live_ais import LiveAISClient, get_api_key, LIVE_AIS_BBOX
@@ -177,7 +183,7 @@ html, body, [data-testid="stApp"] {
 # Full detection pipeline  (cached — runs once per session)
 # ---------------------------------------------------------------------------
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def run_pipeline(source: str = "Simulated",
                  csv_path: str = DEFAULT_AIS_CSV_PATH) -> tuple:
     """
@@ -209,7 +215,7 @@ def run_pipeline(source: str = "Simulated",
     """
     # Zone configuration is source-aware (zones.py). Geofencing algorithm
     # itself is unchanged.
-    zones = get_zones(source)
+    zones = _cached_get_zones(source)
     quality_report: dict = {}
     positions_df = None   # cleaned positions to persist (Historical AIS only)
 
@@ -315,45 +321,9 @@ def run_pipeline(source: str = "Simulated",
 
 
 # ---------------------------------------------------------------------------
-# Real-Time Simulation helpers (M8). Risk is computed only for the simulator's
-# currently-active vessels each tick — not the whole dataset.
+# Real-Time Simulation / Live AIS risk helper — imported from live_risk_cache
+# so it can be tested independently without triggering Streamlit top-level code.
 # ---------------------------------------------------------------------------
-
-def compute_live_risk(state_df, recent_tracks, zones):
-    """
-    Compute unified risk for the simulator's current vessel state.
-
-    state_df      : one-row-per-vessel current positions (from the simulator)
-    recent_tracks : {vessel_id: recent-trajectory DataFrame}
-    zones         : Danish demonstration monitoring zones
-
-    Returns {vessel_id: unified_risk_result}. Uses the same geofencing,
-    behaviour, feature, Isolation Forest and unified risk engine as the batch
-    pipeline — temporal is included when a recent window is long enough.
-    """
-    if state_df is None or state_df.empty:
-        return {}
-    # Behaviour analysis consumes the time-aware DataFrame tracks directly.
-    behavior_map = analyze_all(recent_tracks)
-    # Feature extraction's geometric trajectory arg expects (lat, lon) tuple
-    # lists; convert the recent DataFrame tracks here so both consumers get the
-    # shape they expect.
-    tuple_tracks = {}
-    for _vid, _trk in recent_tracks.items():
-        try:
-            tuple_tracks[_vid] = list(zip(_trk["latitude"].tolist(),
-                                          _trk["longitude"].tolist()))
-        except Exception:
-            tuple_tracks[_vid] = []
-    geo_list = run_geofencing(state_df, zones)
-    geo_map = {g["vessel_id"]: g for g in geo_list}
-    feature_df = build_feature_matrix(state_df, tuple_tracks, geo_map,
-                                      behavior_map=behavior_map)
-    anomaly_map, _st, _m = run_anomaly_detection_with_status(feature_df)
-    temporal_map, _ts, _tm = run_temporal_detection(recent_tracks)
-    return run_risk_engine(state_df["vessel_id"].tolist(), geo_map, feature_df,
-                           anomaly_map, behavior_map=behavior_map,
-                           temporal_map=temporal_map)
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +834,7 @@ if _REALTIME_MODE:
         st.error(f"Could not start replay simulation: {exc}")
         st.stop()
 
-    _rt_zones = _get_zones_rt("Historical AIS")
+    _rt_zones = _cached_get_zones("Historical AIS")
 
     # ── Controls ──────────────────────────────────────────────────────────
     cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 2])
@@ -1116,7 +1086,7 @@ if _LIVE_AIS_MODE:
         _live_df = pd.DataFrame(rows)
         _recent = client.state.get_all_recent_tracks()
         try:
-            _zones_live = get_zones("Historical AIS")
+            _zones_live = _cached_get_zones("Historical AIS")
             _risk = compute_live_risk(_live_df, _recent, _zones_live)
         except Exception as exc:
             st.warning(f"Risk processing temporarily unavailable: {exc}")
@@ -1180,7 +1150,7 @@ if _LIVE_AIS_MODE:
             md["risk_level"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("risk_level", "LOW"))
             md["risk_score"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("overall_score", 0))
             md["zone_status"] = md["vessel_id"].map(lambda v: _risk.get(v, {}).get("zone_status", "Open Waters"))
-            fmap = build_map(md, zones=get_zones("Historical AIS"),
+            fmap = build_map(md, zones=_cached_get_zones("Historical AIS"),
                              center=_center, zoom=_zoom)
             st_folium(fmap, width=None, height=520, returned_objects=[])
         else:
@@ -1188,7 +1158,7 @@ if _LIVE_AIS_MODE:
             fmap = build_map(pd.DataFrame(columns=["vessel_id", "latitude", "longitude",
                                                    "speed", "heading", "behavior",
                                                    "risk_level", "risk_score", "zone_status"]),
-                             zones=get_zones("Historical AIS"),
+                             zones=_cached_get_zones("Historical AIS"),
                              center=_center, zoom=_zoom)
             st_folium(fmap, width=None, height=520, returned_objects=[])
     with live_alert_col:

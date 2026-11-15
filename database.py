@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -48,6 +49,84 @@ class DatabaseError(Exception):
 def _utc_now() -> str:
     """ISO-8601 UTC timestamp string used for computed_at / created_at."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Schema tracking — run executescript only once per db_path per process
+# ---------------------------------------------------------------------------
+
+_schema_initialized: set = set()
+_schema_lock = threading.Lock()
+
+
+def _ensure_schema(conn: sqlite3.Connection, db_path: str) -> None:
+    """Run the DDL only the first time this db_path is seen in this process."""
+    if db_path in _schema_initialized:
+        return
+    with _schema_lock:
+        if db_path not in _schema_initialized:
+            conn.executescript(_SCHEMA)  # _SCHEMA defined below
+            _schema_initialized.add(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Thread-local connection pool for read-heavy dashboard paths.
+# Each OS thread gets its own SQLite connection (SQLite connections are not
+# thread-safe to share).  The connection is validated before reuse with a
+# lightweight ping; a broken connection is replaced automatically.
+# ---------------------------------------------------------------------------
+
+_tlocal = threading.local()
+
+
+def close_thread_connection(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Close and evict the thread-local connection for db_path, if any.
+
+    Call this in tests (or any code that deletes the DB file) to release
+    the Windows file lock held by the thread-local handle.
+    """
+    key = f"conn_{db_path}"
+    conn = getattr(_tlocal, key, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        setattr(_tlocal, key, None)
+    # Also evict from schema tracker so a fresh DB starts clean.
+    with _schema_lock:
+        _schema_initialized.discard(db_path)
+
+
+def get_thread_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Return a per-thread SQLite connection, creating or replacing as needed.
+
+    Uses WAL mode and a 30s busy timeout (same as get_connection).  A broken
+    connection (file moved, WAL locked) is detected via a SELECT 1 ping and
+    replaced transparently — callers never see a stale broken handle.
+
+    Note: two threads may both create a connection on first call; this is
+    benign — SQLite supports multiple readers and WAL lets one writer coexist.
+    """
+    key = f"conn_{db_path}"
+    conn = getattr(_tlocal, key, None)
+    if conn is not None:
+        # Validity ping — replace on any error.
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.Error:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+        setattr(_tlocal, key, conn)
+
+    if conn is None:
+        conn = get_connection(db_path)
+        setattr(_tlocal, key, conn)
+
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +219,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_positions_vessel ON positions (vessel_id);
 CREATE INDEX IF NOT EXISTS idx_risk_vessel      ON risk_scores (vessel_id, computed_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_created   ON alerts (created_at);
+CREATE INDEX IF NOT EXISTS idx_alerts_vessel    ON alerts (vessel_id, created_at);
 """
 
 
@@ -154,6 +234,10 @@ def initialize_database(db_path: str = DEFAULT_DB_PATH) -> None:
         try:
             conn.executescript(_SCHEMA)
             conn.commit()
+            # Mark as initialized so _ensure_schema skips the DDL on
+            # subsequent calls within the same process.
+            with _schema_lock:
+                _schema_initialized.add(db_path)
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -378,8 +462,8 @@ def insert_alerts(alert_rows: List[Dict],
 def get_history_summary(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
     """Return aggregate counts for the History panel."""
     try:
-        conn = get_connection(db_path)
-        conn.executescript(_SCHEMA)
+        conn = get_thread_connection(db_path)
+        _ensure_schema(conn, db_path)
         try:
             cur = conn.cursor()
             def _count(sql: str) -> int:
@@ -392,8 +476,10 @@ def get_history_summary(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
                 "high_alerts":      _count("SELECT COUNT(*) FROM alerts WHERE level = 'HIGH'"),
                 "total_risk_rows":  _count("SELECT COUNT(*) FROM risk_scores"),
             }
-        finally:
-            conn.close()
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"History summary query failed: {exc}") from exc
+    except DatabaseError:
+        raise
     except sqlite3.Error as exc:
         raise DatabaseError(f"History summary query failed: {exc}") from exc
 
@@ -401,17 +487,14 @@ def get_history_summary(db_path: str = DEFAULT_DB_PATH) -> Dict[str, int]:
 def get_recent_alerts(limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> List[Dict]:
     """Return the most recent alerts (newest first)."""
     try:
-        conn = get_connection(db_path)
-        conn.executescript(_SCHEMA)
-        try:
-            rows = conn.execute(
-                """SELECT vessel_id, created_at, level, message, reason
-                   FROM alerts ORDER BY id DESC LIMIT ?""",
-                (int(limit),),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        conn = get_thread_connection(db_path)
+        _ensure_schema(conn, db_path)
+        rows = conn.execute(
+            """SELECT vessel_id, created_at, level, message, reason
+               FROM alerts ORDER BY id DESC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
     except sqlite3.Error as exc:
         raise DatabaseError(f"Recent alerts query failed: {exc}") from exc
 
@@ -419,18 +502,15 @@ def get_recent_alerts(limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> List[D
 def get_recent_risk(limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> List[Dict]:
     """Return the most recent risk assessments (newest first)."""
     try:
-        conn = get_connection(db_path)
-        conn.executescript(_SCHEMA)
-        try:
-            rows = conn.execute(
-                """SELECT vessel_id, computed_at, risk_score, risk_level,
-                          zone_status, behavior
-                   FROM risk_scores ORDER BY id DESC LIMIT ?""",
-                (int(limit),),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        conn = get_thread_connection(db_path)
+        _ensure_schema(conn, db_path)
+        rows = conn.execute(
+            """SELECT vessel_id, computed_at, risk_score, risk_level,
+                      zone_status, behavior
+               FROM risk_scores ORDER BY id DESC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
     except sqlite3.Error as exc:
         raise DatabaseError(f"Recent risk query failed: {exc}") from exc
 
@@ -443,24 +523,21 @@ def get_vessel_recent(vessel_id: str, limit: int = 5,
     Returns {"risk": [...], "alerts": [...]}.
     """
     try:
-        conn = get_connection(db_path)
-        conn.executescript(_SCHEMA)
-        try:
-            risk = conn.execute(
-                """SELECT computed_at, risk_score, risk_level, zone_status, behavior
-                   FROM risk_scores WHERE vessel_id = ?
-                   ORDER BY id DESC LIMIT ?""",
-                (str(vessel_id), int(limit)),
-            ).fetchall()
-            al = conn.execute(
-                """SELECT created_at, level, message, reason
-                   FROM alerts WHERE vessel_id = ?
-                   ORDER BY id DESC LIMIT ?""",
-                (str(vessel_id), int(limit)),
-            ).fetchall()
-            return {"risk": [dict(r) for r in risk],
-                    "alerts": [dict(r) for r in al]}
-        finally:
-            conn.close()
+        conn = get_thread_connection(db_path)
+        _ensure_schema(conn, db_path)
+        risk = conn.execute(
+            """SELECT computed_at, risk_score, risk_level, zone_status, behavior
+               FROM risk_scores WHERE vessel_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (str(vessel_id), int(limit)),
+        ).fetchall()
+        al = conn.execute(
+            """SELECT created_at, level, message, reason
+               FROM alerts WHERE vessel_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (str(vessel_id), int(limit)),
+        ).fetchall()
+        return {"risk": [dict(r) for r in risk],
+                "alerts": [dict(r) for r in al]}
     except sqlite3.Error as exc:
         raise DatabaseError(f"Vessel history query failed: {exc}") from exc

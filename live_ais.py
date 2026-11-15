@@ -404,6 +404,7 @@ class VesselStateManager:
         self._tracks: Dict[str, Deque[Dict]] = {}
         self._static: Dict[str, Dict] = {}  # vessel metadata (type/name/dest/eta)
         self.message_count = 0
+        self.processing_failures = 0  # incremented on parse/update errors
 
     def update_vessel(self, obs: Dict) -> None:
         """Update one vessel's current state + bounded trajectory from a
@@ -421,6 +422,7 @@ class VesselStateManager:
                 "speed":            obs.get("speed"),
                 "heading":          obs.get("heading"),
                 "course":           obs.get("course"),
+                "nav_status":       obs.get("nav_status"),   # HIGH-2 fix: preserve nav_status
                 "timestamp":        obs["timestamp"],
                 "prev_latitude":    prev["latitude"] if prev else None,
                 "prev_longitude":   prev["longitude"] if prev else None,
@@ -628,11 +630,16 @@ class LiveAISClient:
                             stat = normalize_static(msg)
                             if stat is not None:
                                 self.state.update_static(stat)
+                            else:
+                                self.state.processing_failures += 1
                             continue
                         obs = normalize_message(msg)
                         if obs is not None:
                             self.state.update_vessel(obs)
                             self.last_update_at = datetime.now(timezone.utc)
+                        elif mtype == "PositionReport":
+                            # Valid message type but failed normalization
+                            self.state.processing_failures += 1
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
@@ -651,15 +658,16 @@ class LiveAISClient:
     def stats(self) -> Dict:
         """Lightweight runtime statistics for the dashboard (no secrets)."""
         return {
-            "status":             self.status,
-            "last_error":         self.last_error,
-            "vessel_count":       self.state.vessel_count(),
-            "message_count":      self.state.message_count,
-            "last_message_at":    self.last_message_at,
-            "last_update_at":     self.last_update_at,
-            "connected_since":    self.connected_since,
-            "reconnect_attempts": self.reconnect_attempts,
-            "bbox":               self.bbox,
+            "status":               self.status,
+            "last_error":           self.last_error,
+            "vessel_count":         self.state.vessel_count(),
+            "message_count":        self.state.message_count,
+            "processing_failures":  self.state.processing_failures,
+            "last_message_at":      self.last_message_at,
+            "last_update_at":       self.last_update_at,
+            "connected_since":      self.connected_since,
+            "reconnect_attempts":   self.reconnect_attempts,
+            "bbox":                 self.bbox,
         }
 
 
